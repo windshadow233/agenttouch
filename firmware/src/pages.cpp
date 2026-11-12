@@ -916,19 +916,24 @@ bool radioPageTap(int px,int py){
  if(!radioEnabled())return false;
  if(netList){
   if(py>=76&&py<396){int row=(py-76)/80;int index=netListPage*4+row;if(index<radioCount()){radioSelect(index,true);netList=false;}return true;}
-  if(py>=420){if(px<150)radioListStep(-1);else if(px>=330)radioListStep(1);else netList=false;return true;}
+  if(py>=RADIO_FOOTER_TOP){
+   if(py>=402&&py<480){if(px>=12&&px<158)radioListStep(-1);else if(px>=322&&px<468)radioListStep(1);else if(px>=166&&px<314)netList=false;}
+   return true;
+  }
   return true;
  }
- if(py>=436&&py<474){
-  if(px>=24&&px<234){radioRefresh();return true;}
-  if(px>=246&&px<456){netList=true;netListPage=0;return true;}
+ if(py>=RADIO_FOOTER_TOP){
+  if(py>=402&&py<480){
+   if(px>=12&&px<236){radioRefresh();return true;}
+   if(px>=244&&px<468){netList=true;netListPage=0;return true;}
+  }
   return true; // blank toolbar area is not a play/pause button
  }
  return false;
 }
 static void radioButton(Arduino_Canvas* c,int x,int y,int w,const char* title){
- c->fillRoundRect(x,y,w,38,12,AL_INK);c->drawRoundRect(x,y,w,38,12,AL_INKBRD);
- afPrint(c,AF_TINY,x+(w-afWidth(AF_TINY,title))/2,y+26,title,AL_WHITE,AL_INK);
+ c->fillRoundRect(x,y,w,56,12,AL_INK);c->drawRoundRect(x,y,w,56,12,AL_INKBRD);
+ afPrint(c,AF_TINY,x+(w-afWidth(AF_TINY,title))/2,y+35,title,AL_WHITE,AL_INK);
 }
 static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
  c->fillScreen(BG);radioListStep(0);
@@ -947,9 +952,9 @@ static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
   afPrint(c,AF_TINY,32,y+27,pmL1[4+row],AL_WHITE,AL_INK);
   if(pmLines[4+row]>1)afPrint(c,AF_TINY,32,y+52,pmL2[4+row],AL_WHITE,AL_INK);
  }
- radioButton(c,24,430,112,langEn()?"Previous":"上一页");
- radioButton(c,170,430,140,langEn()?"Back":"返回播放");
- radioButton(c,344,430,112,langEn()?"Next":"下一页");
+ radioButton(c,20,408,130,langEn()?"Previous":"上一页");
+ radioButton(c,174,408,132,langEn()?"Back":"返回播放");
+ radioButton(c,330,408,130,langEn()?"Next":"下一页");
 }
 
 // ---- the page ----------------------------------------------------------------
@@ -1053,8 +1058,8 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
   pmPlayPause(c, 240, GLYPH_CY, has && playing, gcol);
 
   if(!mac&&radioEnabled()&&volK<=0.02f){
-    radioButton(c,24,436,210,langEn()?"Fetch":"获取节目");
-    radioButton(c,246,436,210,langEn()?"List":"列表");
+    radioButton(c,24,408,210,langEn()?"Fetch":"获取节目");
+    radioButton(c,246,408,210,langEn()?"List":"列表");
   }
   pmVolume(c, volume, volK);
 }

@@ -37,6 +37,7 @@ bool playSeekBegin(int px, int py);
 bool playSeekUpdate(int px);
 bool playSeekFinish(bool commit);
 bool radioListVisible();
+constexpr int RADIO_FOOTER_TOP=396;
 void radioListStep(int direction);
 bool radioPageTap(int px,int py); // toolbar/list consumes the tap; playback controls remain unchanged
 

@@ -2818,7 +2818,8 @@ static void podcastHoldPoll(int x, int y) {
   int px, py;
   pageXY(x, y, px, py);
   if (shownPage != PAGE_CLOCK || clockView != CV_POD || claimShowing() ||
-      listening || demoStart || playZoneAt(px, py) != tpPodHoldZone ||
+      listening || demoStart || (radioEnabled()&&py>=RADIO_FOOTER_TOP) ||
+      playZoneAt(px, py) != tpPodHoldZone ||
       abs(x - tpStartX) >= 24 || abs(y - tpStartY) >= 24) {
     tpPodHoldZone = 0;                  // leaving the button/dragging cancels this hold
     return;
@@ -2864,7 +2865,7 @@ static void touchPoll() {
         tpPodSeeking = playSeekBegin(px, py);
         tpPodSeekRot = shownRot;
         if(tpPodSeeking)pendH=pendV=0;
-        else tpPodHoldZone = playZoneAt(px, py);
+        else if(!(radioEnabled()&&py>=RADIO_FOOTER_TOP))tpPodHoldZone = playZoneAt(px, py);
       }
       noteActivity();
     }
@@ -3123,7 +3124,12 @@ static void touchPoll() {
         lastPlayTapAt = nowMs;
         int px, py;
         pageXY(tpLastX, tpLastY, px, py);
-        if (!(pageSrc()==PSRC_SD && radioPageTap(px,py)))
+        int startX,startY;
+        pageXY(tpStartX,tpStartY,startX,startY);
+        // A tap that starts in the RSS footer cannot drift into transport.
+        bool leftFooter=pageSrc()==PSRC_SD&&radioEnabled()&&
+                        !radioListVisible()&&startY>=RADIO_FOOTER_TOP&&py<RADIO_FOOTER_TOP;
+        if (!leftFooter&&!(pageSrc()==PSRC_SD && radioPageTap(px,py)))
           playAct(pageSrc(), playZoneAt(px, py));
         audioPlay(SND_TICK);
       }
