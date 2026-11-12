@@ -33,6 +33,38 @@ String feedUrl,error,state="idle",show;
 std::vector<radiofeed::Episode> episodes;
 PlayerInfo info={};
 
+// Bounded NVS history, independent of the SD metadata cache and list order.
+struct ResumePoint {uint64_t id;uint32_t seconds,used;};
+ResumePoint resumePoints[100]={};
+uint32_t resumeClock=0;
+uint64_t episodeId(const std::string& url){
+ uint64_t hash=14695981039346656037ULL;
+ for(unsigned char ch:url){hash^=ch;hash*=1099511628211ULL;}
+ return hash?hash:1;
+}
+uint32_t resumePosition(){
+ if(selected<0||selected>=(int)episodes.size())return 0;
+ const auto& ep=episodes[selected];uint64_t id=episodeId(ep.url);
+ for(const auto& point:resumePoints)if(point.id==id)
+  return ep.duration&&point.seconds>=ep.duration?0:point.seconds;
+ return 0;
+}
+// Caller holds mux. Save the consumed position, never the decoder's read-ahead.
+void saveResume(){
+ if(refresh||selected<0||selected>=(int)episodes.size())return;
+ uint64_t id=episodeId(episodes[selected].url);
+ uint32_t seconds=eof&&!fill?0:baseSec+played/RATE;
+ ResumePoint* slot=&resumePoints[0];
+ for(auto& point:resumePoints){
+  if(point.id==id){slot=&point;break;}
+  if(!point.id||point.used<slot->used)slot=&point;
+ }
+ if(slot->id==id&&slot->seconds==seconds)return;
+ if(!seconds&&slot->id!=id)return;
+ *slot={id,seconds,++resumeClock};
+ prefs.putBytes("resume_v1",resumePoints,sizeof resumePoints);
+}
+
 bool urlOK(const String& u){return radiofeed::urlOK(std::string(u.c_str()))&&u.indexOf('\n')<0&&u.indexOf('\r')<0&&u.indexOf(' ')<0;}
 void copyText(char* out,size_t size,const char* text){auto s=radiofeed::clipped(text?std::string(text):std::string(),size-1);memcpy(out,s.data(),s.size());out[s.size()]=0;}
 bool alive(uint32_t g){Guard l;return enabled&&generation==g;}
@@ -73,7 +105,7 @@ bool cacheLoad(fs::FS& fs,uint32_t g,const String& url){
  Guard l;if(g!=generation||url!=feedUrl)return false;
  // Inserting a card during playback must not replace the current selection.
  if(!episodes.empty())return radiofeed::sameCache(episodes,best)&&show==cachedShow;
- episodes=std::move(best);show=cachedShow;selected=0;refresh=false;want=false;state="idle";error="";
+ episodes=std::move(best);show=cachedShow;selected=0;baseSec=resumePosition();refresh=false;want=false;state="idle";error="";
  return true;
 }
 bool cacheSave(fs::FS& fs,uint32_t g,const String& url){
@@ -229,7 +261,7 @@ void fetchFeed(uint32_t g,const String& url){
  {Guard l;if(g!=generation)return;
   auto merged=radiofeed::mergeCache(parser.items,episodes);
   changed=!radiofeed::sameCache(merged,episodes)||show!=String(parser.show.c_str())||cacheNote.length();
-  episodes=std::move(merged);show=parser.show.c_str();selected=0;
+  episodes=std::move(merged);show=parser.show.c_str();selected=0;baseSec=resumePosition();
   refresh=false;state="idle";error="";bitrate=0;
  }
  if(changed)cacheDirty=true;
@@ -341,6 +373,10 @@ bool radioInit(){
  mux=xSemaphoreCreateMutex();if(!mux)return false;
  ring=(int16_t*)ps_malloc(CAP*sizeof(int16_t));if(!ring)return false;
  prefs.begin("radio",false);feedUrl=prefs.getString("feed","");enabled=prefs.getBool("enabled",false)&&urlOK(feedUrl);
+ size_t resumeBytes=prefs.getBytesLength("resume_v1");
+ if(resumeBytes&&resumeBytes<=sizeof resumePoints&&resumeBytes%sizeof(ResumePoint)==0)
+  prefs.getBytes("resume_v1",resumePoints,resumeBytes);
+ for(const auto& point:resumePoints)resumeClock=std::max(resumeClock,point.used);
  refresh=enabled;state=enabled?"loading":"idle";
  initialized=xTaskCreatePinnedToCore(worker,"rss-mp3",16384,nullptr,1,nullptr,0)==pdPASS;
  return initialized;
@@ -348,24 +384,24 @@ bool radioInit(){
 bool radioEnabled(){if(!initialized)return false;Guard l;return enabled;}
 bool radioConfigure(const char* url,bool on){
  if(!initialized)return false;String value=url?url:"";value.trim();if((on||value.length())&&!urlOK(value))return false;
- {Guard l;bool changed=value!=feedUrl;enabled=on;feedUrl=value;++generation;want=false;
+ {Guard l;saveResume();bool changed=value!=feedUrl;enabled=on;feedUrl=value;++generation;want=false;
   if(changed){episodes.clear();selected=-1;show="";}
-  cachePending=on&&episodes.empty();refresh=on&&episodes.empty();bitrate=0;baseSec=0;clearBuffer();error="";state=refresh?"loading":"idle";
+  cachePending=on&&episodes.empty();refresh=on&&episodes.empty();bitrate=0;baseSec=resumePosition();clearBuffer();error="";state=refresh?"loading":"idle";
  }
  prefs.putString("feed",value);prefs.putBool("enabled",on);return true;
 }
 void radioDisable(){if(!initialized)return;String saved;{Guard l;saved=feedUrl;}radioConfigure(saved.c_str(),false);}
-void radioRefresh(){if(!initialized)return;Guard l;if(!enabled)return;++generation;cachePending=false;want=false;refresh=true;baseSec=0;clearBuffer();state="loading";error="";}
+void radioRefresh(){if(!initialized)return;Guard l;if(!enabled)return;saveResume();++generation;cachePending=false;want=false;refresh=true;baseSec=0;clearBuffer();state="loading";error="";}
 void radioSelect(int i,bool play){if(!initialized)return;Guard l;if(i<0||i>=(int)episodes.size())return;
- selected=i;++generation;want=play;refresh=false;baseSec=0;bitrate=0;audioStart=0;clearBuffer();state=play?"buffering":"paused";error="";}
+ saveResume();selected=i;++generation;want=play;refresh=false;baseSec=resumePosition();bitrate=0;audioStart=0;clearBuffer();state=play?"buffering":"paused";error="";}
 void radioSkip(int delta){if(!initialized)return;int i,n;bool playing;{Guard l;i=selected;n=episodes.size();playing=want;}if(n)radioSelect((i+delta+n)%n,playing);}
 void radioToggle(){if(!initialized)return;Guard l;if(!enabled||episodes.empty()||refresh)return;
- if(want){want=false;state="paused";}else{want=true;if(state=="error"||(!decoding&&!eof)){++generation;clearBuffer();}state=buffering?"buffering":"playing";}}
-void radioPause(){if(!initialized)return;Guard l;want=false;if(enabled)state="paused";}
+ if(want){saveResume();want=false;state="paused";}else{want=true;if(state=="error"||(!decoding&&!eof)){baseSec+=played/RATE;++generation;clearBuffer();}state=buffering?"buffering":"playing";}}
+void radioPause(){if(!initialized)return;Guard l;saveResume();want=false;if(enabled)state="paused";}
 static bool radioSeekLocked(uint32_t pos){
  if(!enabled||selected<0||selected>=(int)episodes.size()||refresh)return false;
  if(episodes[selected].duration&&pos>=episodes[selected].duration)pos=episodes[selected].duration-1;
- baseSec=pos;++generation;clearBuffer();state=want?"buffering":"paused";error="";return true;
+ baseSec=pos;++generation;clearBuffer();if(!want)saveResume();state=want?"buffering":"paused";error="";return true;
 }
 void radioSeek(int32_t delta){if(!initialized)return;Guard l;
  int64_t pos=(int64_t)baseSec+played/RATE+delta;if(pos<0)pos=0;

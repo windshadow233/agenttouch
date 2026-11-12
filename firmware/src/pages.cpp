@@ -911,18 +911,17 @@ static void pmVolume(Arduino_Canvas* c, uint8_t vol, float k) {
 static bool netList=false;
 static int netListPage=0;
 bool radioListVisible(){return radioEnabled()&&netList;}
-void radioListStep(int dir){int pages=(radioCount()+3)/4;if(pages<1)pages=1;netListPage+=dir;if(netListPage<0)netListPage=0;if(netListPage>=pages)netListPage=pages-1;}
+void radioListStep(int dir){int pages=std::max(1,(radioCount()+3)/4);netListPage=((netListPage+dir)%pages+pages)%pages;}
 bool radioPageTap(int px,int py){
  if(!radioEnabled())return false;
  if(netList){
-  if(py<60){if(px>=340)radioRefresh();else if(px<130)netList=false;return true;}
   if(py>=76&&py<396){int row=(py-76)/80;int index=netListPage*4+row;if(index<radioCount()){radioSelect(index,true);netList=false;}return true;}
   if(py>=420){if(px<150)radioListStep(-1);else if(px>=330)radioListStep(1);else netList=false;return true;}
   return true;
  }
- if(py>=432&&py<478){
-  if(px>=24&&px<134){radioRefresh();return true;}
-  if(px>=146&&px<256){netList=true;netListPage=0;return true;}
+ if(py>=436&&py<474){
+  if(px>=24&&px<234){radioRefresh();return true;}
+  if(px>=246&&px<456){netList=true;netListPage=0;return true;}
   return true; // blank toolbar area is not a play/pause button
  }
  return false;
@@ -933,13 +932,11 @@ static void radioButton(Arduino_Canvas* c,int x,int y,int w,const char* title){
 }
 static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
  c->fillScreen(BG);radioListStep(0);
- radioButton(c,16,12,100,langEn()?"Back":"返回");
- radioButton(c,350,12,114,langEn()?"Refresh":"刷新");
  char count[40];int n=radioCount();snprintf(count,sizeof count,"%d / %d",netListPage+1,std::max(1,(n+3)/4));
  afPrint(c,AF_TINY,240-afWidth(AF_TINY,count)/2,39,count,AL_GREY);
  char status[128];afFit(status,sizeof status,AF_TINY,radioInfo().show,440);
  afPrint(c,AF_TINY,20,70,status,AL_GREY);
- if(!n){const char* line="No episodes - tap Refresh";afPrint(c,AF_TINY,240-afWidth(AF_TINY,line)/2,235,line,AL_GREY);}
+ if(!n){const char* line=langEn()?"Fetch episodes on playback page":"请返回播放页获取节目";afPrint(c,AF_TINY,240-afWidth(AF_TINY,line)/2,235,line,AL_GREY);}
  int selected=playerInfo().index;
  for(int row=0;row<4;++row){
   int index=netListPage*4+row;char title[192];unsigned duration=0;
@@ -986,7 +983,7 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
   if (!has) {
     // empty state: two lines in the middle of the card, glyphs dimmed
     const char* head = !mac&&radioEnabled()?(langEn()?"RSS Podcasts":"网络播客"):tr(mac ? S_NP_EMPTY : S_POD_EMPTY);
-    const char* hint = !mac&&radioEnabled()?(pi.show[0]?pi.show:"Tap Refresh"):tr(mac ? S_NP_HINT : S_POD_HINT);
+    const char* hint = !mac&&radioEnabled()?(pi.show[0]?pi.show:(langEn()?"Tap Fetch":"点击获取节目")):tr(mac ? S_NP_HINT : S_POD_HINT);
     pmText(3, AF_TINY, hint, CARD_W - 56, true);
     int lines = pmLines[3];
     int base = lines == 2 ? 118 : 128;
@@ -1056,8 +1053,8 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
   pmPlayPause(c, 240, GLYPH_CY, has && playing, gcol);
 
   if(!mac&&radioEnabled()&&volK<=0.02f){
-    radioButton(c,24,436,110,langEn()?"Refresh":"刷新");
-    radioButton(c,146,436,110,langEn()?"List":"列表");
+    radioButton(c,24,436,210,langEn()?"Fetch":"获取节目");
+    radioButton(c,246,436,210,langEn()?"List":"列表");
   }
   pmVolume(c, volume, volK);
 }

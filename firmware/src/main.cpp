@@ -1234,6 +1234,7 @@ static void otaRun(int id, const char* path, uint32_t size, uint32_t wantCrc) {
   Serial.printf("ota: ok %lu B in %lu ms -> %s, restarting\n", (unsigned long)got,
                 (unsigned long)(millis() - t0), boot ? boot->label : "?");
   otaScreen("REBOOT");
+  playerPause();
   delay(500);                                  // let the reply leave over TCP/BLE
   ESP.restart();
 }
@@ -1252,6 +1253,7 @@ static void otaRollback(int id) {
   if (!(r["ok"] | false)) return;
   Serial.printf("ota: rollback -> %s (%s), restarting\n", other->label, desc.version);
   otaScreen("ROLLBACK");
+  playerPause();
   delay(500);
   ESP.restart();
 }
@@ -2504,6 +2506,7 @@ static void powerOff(const char* msg) {
   // then "rescue" us into a reboot ~15 s after the goodbye. Unsubscribe first
   // so the board just sits there dark, which is what the user asked for.
   wdtLeave();
+  playerPause();                   // stop playback and save RSS/local progress
   playerSaveState();               // where the episode got to, before the rail dies
   audioPlay(SND_BYE);              // plays during the animation delay below
   canvas->fillScreen(0);
