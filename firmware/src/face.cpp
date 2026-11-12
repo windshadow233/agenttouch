@@ -539,7 +539,8 @@ static void drawToast(Arduino_Canvas* c, const FaceFrame& f, uint32_t t,
   }
   float k = kDots;
   int slot = 0;
-  for (int i = 0; i < N_AGENTS; i++) {
+  for (int position = 0; position < N_AGENTS; position++) {
+    int i = seatAtDisplayPosition(position);
     if (!vis[i]) continue;
     float lvl;
     switch (f.agentStates[i]) {

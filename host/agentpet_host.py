@@ -8307,7 +8307,7 @@ class HookHandler(BaseHTTPRequestHandler):
                 "fonts": dict(font_rt),
                 "agents": snap["agents"],
                 "active": snap["active"],
-                "seats": list(AGENTS),
+                "seats": ["codex", "claude"] + AGENTS[2:],
                 "installed": seats_installed(),
                 "owner": owner_snapshot(),
                 "skins": dict(board_skins),       # {} until a board said hello

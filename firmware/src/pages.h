@@ -33,6 +33,9 @@ bool npPlaying();
 void npSnapshot(float* pos, float* dur, bool* play);   // interpolated, for {"t":"plst"}
 // tap zones of the compact card's transport band (page frame): -1 prev/-15 s, +1 next/+15 s, 0 toggle
 int playZoneAt(int px, int py);
+bool playSeekBegin(int px, int py);
+bool playSeekUpdate(int px);
+bool playSeekFinish(bool commit);
 bool radioListVisible();
 void radioListStep(int direction);
 bool radioPageTap(int px,int py); // toolbar/list consumes the tap; playback controls remain unchanged

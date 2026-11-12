@@ -74,6 +74,15 @@ static const AgentDef AGENTS[] = {
 };
 static const int N_AGENTS = sizeof(AGENTS) / sizeof(AGENTS[0]);
 
+// Display order: Codex, Claude, then the remaining seats. Keep AGENTS in
+// protocol/report order so existing state, skin and history indices stay valid.
+static inline int seatAtDisplayPosition(int position) {
+  return position < 2 ? 1 - position : position;
+}
+static inline int seatDisplayPosition(int seat) {
+  return seat < 2 ? 1 - seat : seat;
+}
+
 // A background agent flipping to needs_you steals the big face (the overview
 // dots always hint at the others). Set 0 to keep focus fully manual.
 #define AUTO_FOCUS_NEEDS_YOU 1

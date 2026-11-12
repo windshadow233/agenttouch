@@ -13,6 +13,7 @@ void radioPause();
 void radioSkip(int delta);
 void radioSelect(int index, bool play=true);
 void radioSeek(int32_t delta);
+bool radioSeekTo(uint32_t seconds);
 bool radioPlaying();
 bool radioWantPlay();
 uint32_t radioPull(int16_t* out, uint32_t maxSamples);

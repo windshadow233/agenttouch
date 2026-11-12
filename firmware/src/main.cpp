@@ -108,7 +108,7 @@ static bool     agentUnread[N_AGENTS] = {false};
 static int8_t   capSeat = -1;
 static char     capId[9] = "";
 static uint32_t capAt = 0;
-static int      selected  = 0;
+static int      selected  = seatAtDisplayPosition(0);
 static bool     hostUp    = false;
 static bool     listening = false;
 static uint32_t nudgeUntil = 0;   // pin the status toast until this millis()
@@ -332,8 +332,8 @@ static uint32_t uptimeSec() {
 // the rule lands on the switching sequence: swiping / cycling skips a seat
 // that is off RIGHT NOW (not "never seen running" — that was sticky and kept
 // a quit app in the way). Only this instant counts, so a seat that comes
-// back is reachable again at its own fixed index; it is a filter, never a
-// reorder. Host-pushed selects ignore all of this (reverse follow must land
+// back is reachable again at its fixed display position. Filtering does not
+// change protocol indices. Host-pushed selects ignore this (reverse follow must land
 // where the Mac is) and so does the needs_you screen grab.
 // 设置项「显示离线席位」: host cfg {"show_off":0|1}, NVS "showoff",
 // default hidden. Turning it on switches every rule in this block off at once
@@ -346,18 +346,20 @@ static bool anySeatOn() {
     if (agentStates[i] != ST_OFF) return true;
   return false;
 }
-// step +1 = next index, -1 = previous. With every seat off nothing is
+// step +1 = next display position, -1 = previous. With every seat off nothing is
 // skipped: all five stay reachable and the picture does not collapse (the
 // host being down puts us here too). With exactly one seat on it returns
 // that seat — including when it IS the current one, so a swipe becomes a
 // no-op instead of landing on a dead app.
 static int nextSeat(int from, int step) {
   int adv = step > 0 ? 1 : N_AGENTS - 1;
-  int n = (from + adv) % N_AGENTS;
+  int position = (seatDisplayPosition(from) + adv) % N_AGENTS;
+  int n = seatAtDisplayPosition(position);
   if (showOffSeats || !anySeatOn()) return n;
   for (int k = 0; k < N_AGENTS; k++) {
     if (agentStates[n] != ST_OFF) return n;
-    n = (n + adv) % N_AGENTS;
+    position = (position + adv) % N_AGENTS;
+    n = seatAtDisplayPosition(position);
   }
   return n;                                    // unreachable: anySeatOn() held
 }
@@ -638,7 +640,7 @@ static void sessStep(int dir) {
 
 // 隐藏 = 当前 off 就不画: the seat we are sitting on
 // went off while others are still up, so move to the first non-off seat in
-// fixed index order — otherwise the pet stares at a quit app that swiping
+// display order — otherwise the pet stares at a quit app that swiping
 // can no longer reach. Silent, and src:"auto" tells the host this was
 // nobody's intent: retarget dictation, but no `open -a` resurrecting the app
 // it just quit and no board-just-acted lockout on reverse follow.
@@ -649,7 +651,8 @@ static void sessStep(int dir) {
 static void autoReselectIfOff() {
   if (showOffSeats) return;
   if (agentStates[selected] != ST_OFF || !anySeatOn()) return;
-  for (int i = 0; i < N_AGENTS; i++) {
+  for (int position = 0; position < N_AGENTS; position++) {
+    int i = seatAtDisplayPosition(position);
     if (agentStates[i] == ST_OFF) continue;
     selected = i;
     JsonDocument r;
@@ -2749,6 +2752,8 @@ static int tpLastX  = 0, tpLastY  = 0;   // latest point while held
 static uint32_t tpDownAt = 0;            // press-down time (long-press actions)
 static bool tpConsumed = false;          // hold already acted; release is a no-op
 static int tpPodHoldZone = 0;           // latched podcast side button; 0 = ineligible
+static bool tpPodSeeking = false;
+static uint8_t tpPodSeekRot = 0;
 static int8_t  petDir     = 0;           // dominant-axis stroke dir while held (±1 x, ±2 y)
 static uint8_t petStrokes = 0;           // direction reversals in this touch
 
@@ -2848,11 +2853,15 @@ static void touchPoll() {
       tpDownAt = millis();
       tpConsumed = false;
       tpPodHoldZone = 0;
+      tpPodSeeking = false;
       if (shownPage == PAGE_CLOCK && clockView == CV_POD && !claimShowing() &&
           !listening && !demoStart) {
         int px, py;
         pageXY(x, y, px, py);
-        tpPodHoldZone = playZoneAt(px, py);
+        tpPodSeeking = playSeekBegin(px, py);
+        tpPodSeekRot = shownRot;
+        if(tpPodSeeking)pendH=pendV=0;
+        else tpPodHoldZone = playZoneAt(px, py);
       }
       noteActivity();
     }
@@ -2886,6 +2895,13 @@ static void touchPoll() {
       }
     }
     tpLastX = x; tpLastY = y;
+    if(tpPodSeeking){
+      int px,py;pageXY(x,y,px,py);
+      if(shownPage!=PAGE_CLOCK||clockView!=CV_POD||shownRot!=tpPodSeekRot||
+         claimShowing()||listening||demoStart||!playSeekUpdate(px)){
+        playSeekFinish(false);tpPodSeeking=false;tpConsumed=true;
+      }
+    }
     podcastHoldPoll(x, y);
 
     // hold ~1.5 s on the face = settings card. The approve bubble keeps its
@@ -2908,6 +2924,12 @@ static void touchPoll() {
   }
   // classify on release, so a swipe never fires the tap action first
   if (!down && tpWasDown) {
+    if(tpPodSeeking){
+      bool valid=shownPage==PAGE_CLOCK&&clockView==CV_POD&&shownRot==tpPodSeekRot&&
+                 !claimShowing()&&!listening&&!demoStart;
+      if(playSeekFinish(valid))audioPlay(SND_TICK);
+      tpPodSeeking=false;tpConsumed=true;pendH=pendV=0;
+    }
     bool wasPetting = (int32_t)(petUntil - millis()) > 0;
     petDir = 0; petStrokes = 0;
     int dx = tpLastX - tpStartX, dy = tpLastY - tpStartY;

@@ -282,14 +282,19 @@ void playerPrev() { if (radioEnabled()) radioSkip(-1); else plSkip(-1); }
 // re-seeks inside the open file (no suspend needed for a seek).
 void playerSeek(int32_t dsec) {
   if (radioEnabled()) { radioSeek(dsec); return; }
-  if (s_n <= 0 || s_cur < 0) return;
-  int32_t blk = (int32_t)s_blk + dsec;
-  if (blk < 0) blk = 0;
+  int64_t target = (int64_t)s_blk + dsec;
+  playerSeekTo((uint32_t)(target < 0 ? 0 : target));
+}
+
+bool playerSeekTo(uint32_t seconds) {
+  if (radioEnabled()) return radioSeekTo(seconds);
+  if (s_n <= 0 || s_cur < 0) return false;
   uint32_t total = gInfo.durSec ? gInfo.durSec : (s_openIdx == s_cur ? s_nblk : 0);
-  if (total && blk >= (int32_t)total) blk = (int32_t)total - 1;
-  s_blk = (uint32_t)blk;
+  if (total && seconds >= total) seconds = total - 1;
+  s_blk = seconds;
   s_seekGen++;
   if (!s_want) playerSaveState();
+  return true;
 }
 
 bool playerRunning() { return s_running; }

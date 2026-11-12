@@ -32,6 +32,7 @@ void playerNext();
 void playerPrev();
 void playerPause();
 void playerSeek(int32_t dsec);   // ±seconds inside the current episode (block granularity, clamped)
+bool playerSeekTo(uint32_t seconds); // absolute position; preserve play/pause state
 bool playerPlaying();
 bool playerRunning(); // audio task currently pulling PCM
 const PlayerInfo& playerInfo();

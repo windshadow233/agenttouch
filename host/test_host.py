@@ -3657,7 +3657,7 @@ class SettingsEndpointTests(unittest.TestCase):
         self.assertIsInstance(d["ble"], bool)
         self.assertIn("build", d["fw"])
         self.assertEqual(sorted(d["agents"]), sorted(H.AGENTS))
-        self.assertEqual(d["seats"], list(H.AGENTS))
+        self.assertEqual(d["seats"], ["codex", "claude"] + H.AGENTS[2:])
         self.assertIn(d["active"], H.AGENTS)
         self.assertFalse(d["mic_sink_ok"])                 # stubbed at a temp path
 

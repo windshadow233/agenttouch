@@ -856,6 +856,37 @@ static void pmFmtTime(char* out, size_t n, uint32_t sec) {
   else             snprintf(out, n, "%lu:%02lu", (unsigned long)(sec / 60), (unsigned long)(sec % 60));
 }
 
+// The finger owns this gesture until release; only the preview moves while
+// held. Keep the episode identity so a background change cancels the seek.
+static bool pmSeeking=false;
+static PlayerInfo pmSeekEpisode={};
+static uint32_t pmSeekPosition=0;
+static bool pmSeekMatches(){
+ const PlayerInfo& pi=playerInfo();
+ return pi.hasItems&&pi.index==pmSeekEpisode.index&&pi.durSec==pmSeekEpisode.durSec&&
+        !strcmp(pi.title,pmSeekEpisode.title)&&!radioListVisible();
+}
+bool playSeekUpdate(int px){
+ if(!pmSeeking||!pmSeekMatches())return false;
+ int x=std::max(0,std::min((int)SLIDER_W,px-SLIDER_X));
+ pmSeekPosition=std::min(pmSeekEpisode.durSec-1,
+                        (uint32_t)((uint64_t)x*pmSeekEpisode.durSec/SLIDER_W));
+ return true;
+}
+bool playSeekBegin(int px,int py){
+ const PlayerInfo& pi=playerInfo();
+ if(radioListVisible()||!pi.hasItems||pi.durSec<2||
+    px<SLIDER_X-12||px>SLIDER_X+SLIDER_W+12||abs(py-(SLIDER_Y+2))>16)return false;
+ pmSeekEpisode=pi;pmSeeking=true;
+ if(playSeekUpdate(px))return true;
+ pmSeeking=false;return false;
+}
+bool playSeekFinish(bool commit){
+ bool valid=pmSeeking&&commit&&pmSeekMatches();
+ pmSeeking=false;
+ return valid&&playerSeekTo(pmSeekPosition);
+}
+
 // Volume toast in the bottom band (y 424..480 is empty by design): speaker,
 // 236 px bar, level. Horizontal readout for an up/down gesture is the
 // keyboard-volume-HUD convention (Mac, iOS landscape); the user preferred it
@@ -969,6 +1000,8 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
     playing = mac ? npIsPlaying : pi.playing;
     float pos = mac ? npPosNow() : (float)pi.posSec;
     float dur = mac ? npDur : (float)pi.durSec;
+    bool seeking=!mac&&pmSeeking&&pmSeekMatches();
+    if(seeking)pos=(float)pmSeekPosition;
 
     char sub[288];
     sub[0] = 0;
@@ -1000,8 +1033,10 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
     c->fillRoundRect(SLIDER_X, SLIDER_Y, SLIDER_W, 4, 2, PM_TRACK);
     if (dur > 1.0f) {
       int fill = (int)(SLIDER_W * (pos / dur));
+      if (fill < 0) fill = 0;
       if (fill > SLIDER_W) fill = SLIDER_W;
-      if (fill >= 4) c->fillRoundRect(SLIDER_X, SLIDER_Y, fill, 4, 2, playing ? accent : AL_DIM);
+      if (fill >= 4) c->fillRoundRect(SLIDER_X, SLIDER_Y, fill, 4, 2, (playing||seeking) ? accent : AL_DIM);
+      if(!mac)c->fillCircle(SLIDER_X+fill,SLIDER_Y+2,seeking?8:5,accent);
     }
     char el[16], rm[18];
     uint32_t p = (uint32_t)(pos < 0 ? 0 : pos), d = (uint32_t)(dur < 0 ? 0 : dur);

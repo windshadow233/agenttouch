@@ -2,8 +2,7 @@
 #include "audio.h"
 #include "rss_feed.h"
 #include "rss_cache.h"
-#include <SPIFFS.h>
-#include <esp_partition.h>
+#include "sdcard.h"
 #include "radio_dsp.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -40,33 +39,24 @@ bool alive(uint32_t g){Guard l;return enabled&&generation==g;}
 void fail(uint32_t g,const String& why){Guard l;if(g==generation){error=why;state="error";want=false;}}
 void clearBuffer(){head=tail=fill=played=0;buffering=true;eof=false;}
 
-// Metadata only. Use the existing data partition, without erasing an unknown
-// filesystem. A blank partition may be initialized; existing files are preserved.
+// Metadata only, on an already-mounted SD card. Never format storage here.
 bool cacheStorageReady=false,cachePending=true;
+bool cacheDirty=false; // owned by the network/decoder worker
+fs::FS* cacheFs=nullptr;
+uint32_t cacheRetryAt=0;
 uint64_t cacheSequence=0;
 String cacheNote;
-constexpr const char* CACHE_SLOTS[2]={"/agenttouch-rss-a.json","/agenttouch-rss-b.json"};
+constexpr const char* CACHE_SLOTS[2]={"/agentpet/rss-a.json","/agentpet/rss-b.json"};
+constexpr const char* CACHE_TEMP="/agentpet/rss.tmp";
 struct CacheAllocator : ArduinoJson::Allocator {
  void* allocate(size_t n) override{return heap_caps_malloc(n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
  void deallocate(void* p) override{free(p);}
  void* reallocate(void* p,size_t n) override{return heap_caps_realloc(p,n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
 };
-bool cacheMount(){
- if(SPIFFS.begin(false))return true;
- const esp_partition_t* part=esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,"spiffs");
- if(!part)return false;
- std::unique_ptr<uint8_t,decltype(&free)> block((uint8_t*)ps_malloc(4096),free);if(!block)return false;
- for(size_t at=0;at<part->size;at+=4096){size_t n=std::min((size_t)4096,(size_t)part->size-at);
-  if(esp_partition_read(part,at,block.get(),n)!=ESP_OK)return false;
-  for(size_t i=0;i<n;++i)if(block.get()[i]!=0xff)return false;
-  taskYIELD();
- }
- return SPIFFS.format()&&SPIFFS.begin(false);
-}
-bool cacheLoad(uint32_t g,const String& url){
+bool cacheLoad(fs::FS& fs,uint32_t g,const String& url){
  std::vector<radiofeed::Episode> best;String cachedShow;uint64_t bestSeq=0;
  for(const char* path:CACHE_SLOTS){
-  File file=SPIFFS.open(path,FILE_READ);if(!file||file.size()>160*1024){if(file)file.close();continue;}
+  File file=fs.open(path,FILE_READ);if(!file||file.size()>160*1024){if(file)file.close();continue;}
   CacheAllocator allocator;JsonDocument doc(&allocator);auto err=deserializeJson(doc,file);file.close();if(err)continue;
   uint64_t seq=doc["seq"] | (uint64_t)0;
   cacheSequence=std::max(cacheSequence,seq); // worker owns the disk sequence
@@ -81,23 +71,52 @@ bool cacheLoad(uint32_t g,const String& url){
  }
  if(best.empty())return false;
  Guard l;if(g!=generation||url!=feedUrl)return false;
+ // Inserting a card during playback must not replace the current selection.
+ if(!episodes.empty())return radiofeed::sameCache(episodes,best)&&show==cachedShow;
  episodes=std::move(best);show=cachedShow;selected=0;refresh=false;want=false;state="idle";error="";
  return true;
 }
-void cacheSave(uint32_t g,const String& url){
- CacheAllocator allocator;JsonDocument doc(&allocator);doc["version"]=1;doc["feed"]=url;doc["seq"]=++cacheSequence;
- {Guard l;if(g!=generation||url!=feedUrl)return;doc["show"]=show;
+bool cacheSave(fs::FS& fs,uint32_t g,const String& url){
+ uint64_t nextSequence=cacheSequence+1;
+ CacheAllocator allocator;JsonDocument doc(&allocator);doc["version"]=1;doc["feed"]=url;doc["seq"]=nextSequence;
+ {Guard l;if(g!=generation||url!=feedUrl||episodes.empty())return false;doc["show"]=show;
   JsonArray items=doc["items"].to<JsonArray>();for(const auto& e:episodes){JsonObject item=items.add<JsonObject>();item["title"]=e.title;item["url"]=e.url;item["dur"]=e.duration;}
  }
- if(doc.overflowed()||measureJson(doc)>160*1024){Guard l;cacheNote="metadata cache too large";return;}
+ if(doc.overflowed()||measureJson(doc)>160*1024){Guard l;cacheNote="metadata cache too large";return false;}
  String data;serializeJson(doc,data);
- File tmp=SPIFFS.open("/agenttouch-rss.tmp",FILE_WRITE);
+ if(!fs.exists("/agentpet")&&!fs.mkdir("/agentpet")){Guard l;cacheNote="SD cache directory unavailable";return false;}
+ File tmp=fs.open(CACHE_TEMP,FILE_WRITE);
  bool ok=tmp&&tmp.write((const uint8_t*)data.c_str(),data.length())==data.length();if(tmp){tmp.flush();tmp.close();}
- const char* destination=CACHE_SLOTS[cacheSequence%2];
- if(ok){SPIFFS.remove(destination);ok=SPIFFS.rename("/agenttouch-rss.tmp",destination);}
+ const char* destination=CACHE_SLOTS[nextSequence%2];
+ if(ok){if(fs.exists(destination))ok=fs.remove(destination);if(ok)ok=fs.rename(CACHE_TEMP,destination);}
  // The other slot remains valid if power is lost before this replacement.
- if(!ok)SPIFFS.remove("/agenttouch-rss.tmp");
- Guard l;cacheNote=ok?"":"metadata cache write failed";
+ if(!ok)fs.remove(CACHE_TEMP);
+ if(ok)cacheSequence=nextSequence;
+ Guard l;cacheNote=ok?"":"SD metadata cache write failed";return ok;
+}
+void cacheService(){
+ fs::FS* fs=sdFs();
+ {Guard l;cacheStorageReady=fs!=nullptr;
+  if(!fs){cacheNote="No SD card; RSS list is RAM only";cacheFs=nullptr;return;}
+ }
+ bool load;uint32_t g;String url;
+ {Guard l;
+  if(!enabled)return;
+  load=cachePending||fs!=cacheFs;g=generation;url=feedUrl;
+  if(!load&&!cacheDirty)return;
+  if(!load&&(int32_t)(millis()-cacheRetryAt)<0)return;
+  cachePending=false;
+ }
+ if(load){
+  cacheFs=fs;cacheSequence=0;
+  bool loaded=cacheLoad(*fs,g,url);
+  Guard l;cacheNote="";
+  cacheDirty=!loaded&&!episodes.empty();
+ }
+ if(cacheDirty){
+  cacheDirty=!cacheSave(*fs,g,url);
+  cacheRetryAt=millis()+5000;
+ }
 }
 
 // Body reader supports Content-Length, close-delimited and chunked responses.
@@ -147,6 +166,8 @@ public:
  explicit Reader(uint32_t g):gen(g){}
  ~Reader(){http.end();}
  bool open(const String& url,uint64_t offset=0){
+  http.end();problem="";status=0;total=0;chunk=0;remaining=-1;
+  chunked=needCRLF=ended=false;
   if(!urlOK(url)){problem="invalid HTTP(S) URL";return false;}
   http.setConnectTimeout(15000);http.setTimeout(5000);http.setReuse(false);http.useHTTP10(true);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);http.setRedirectLimit(5);
@@ -211,12 +232,14 @@ void fetchFeed(uint32_t g,const String& url){
   episodes=std::move(merged);show=parser.show.c_str();selected=0;
   refresh=false;state="idle";error="";bitrate=0;
  }
- if(cacheStorageReady&&changed)cacheSave(g,url);
+ if(changed)cacheDirty=true;
+ cacheService();
 }
 
 bool putSamples(uint32_t g,const int16_t* samples,uint32_t n){
  uint32_t off=0;
  while(off<n){
+  cacheService(); // also handles a card inserted while streaming/paused
   uint32_t written=0;
   {Guard l;if(g!=generation||!enabled)return false;
    written=std::min(n-off,CAP-fill);
@@ -233,7 +256,7 @@ void playStream(uint32_t g,const radiofeed::Episode& ep,uint32_t position,int ra
  if(!clockReady(g)){fail(g,"Clock sync failed");return;}
  uint32_t tagOffset;{Guard l;tagOffset=audioStart;}
  uint64_t offset=position&&rateKbps>0?tagOffset+(uint64_t)position*rateKbps*125:0;
- if(position&&!offset){fail(g,"Play briefly before seeking");return;}
+ bool probeSeek=position&&!offset; // learn MP3 bitrate before the first seek
  Reader reader(g);if(!reader.open(ep.url.c_str(),offset)){fail(g,reader.problem);return;}
  std::unique_ptr<drmp3dec,decltype(&free)> decoder((drmp3dec*)ps_malloc(sizeof(drmp3dec)),free);
  std::unique_ptr<uint8_t,decltype(&free)> input((uint8_t*)ps_malloc(32768),free);
@@ -266,6 +289,16 @@ void playStream(uint32_t g,const radiofeed::Episode& ep,uint32_t position,int ra
   else if(done)break;
   else if(used>=16384){memmove(input.get(),input.get()+used-3,3);used=3;}
   if(samples>0){
+   if(probeSeek){
+    // Reuse the connection/decoder buffers: a second live TLS connection
+    // would consume scarce internal RAM. Range seeking remains approximate.
+    if(frame.bitrate_kbps<=0){fail(g,"Could not determine MP3 bitrate");return;}
+    {Guard l;if(g!=generation)return;bitrate=frame.bitrate_kbps;tagOffset=audioStart;}
+    offset=tagOffset+(uint64_t)position*frame.bitrate_kbps*125;
+    if(!reader.open(ep.url.c_str(),offset)){fail(g,reader.problem);return;}
+    drmp3dec_init(decoder.get());used=0;done=false;probeSeek=false;
+    noAudioAt=millis();continue;
+   }
    decoded=true;noAudioAt=millis();
    {Guard l;if(g!=generation)return;bitrate=frame.bitrate_kbps;}
    if(!resampler.push(pcm.get(),samples,frame.channels,frame.sample_rate,emit))return;
@@ -279,13 +312,9 @@ void playStream(uint32_t g,const radiofeed::Episode& ep,uint32_t position,int ra
 }
 
 void worker(void*){
- bool mounted=cacheMount();
- {Guard l;cacheStorageReady=mounted;if(!mounted)cacheNote="Flash cache unavailable; existing storage was not erased";}
  uint32_t handled=0;
  for(;;){
-  uint32_t loadGeneration;String loadFeed;bool load;
-  {Guard l;load=cachePending&&enabled;cachePending=false;loadGeneration=generation;loadFeed=feedUrl;}
-  if(load&&mounted)cacheLoad(loadGeneration,loadFeed);
+  cacheService();
   uint32_t g,pos;bool doRefresh,play;String url;radiofeed::Episode ep;int kbps;
   {Guard l;g=generation;url=feedUrl;doRefresh=enabled&&refresh;pos=baseSec;kbps=bitrate;
    play=enabled&&want&&!refresh&&selected>=0&&selected<(int)episodes.size();
@@ -333,10 +362,15 @@ void radioSkip(int delta){if(!initialized)return;int i,n;bool playing;{Guard l;i
 void radioToggle(){if(!initialized)return;Guard l;if(!enabled||episodes.empty()||refresh)return;
  if(want){want=false;state="paused";}else{want=true;if(state=="error"||(!decoding&&!eof)){++generation;clearBuffer();}state=buffering?"buffering":"playing";}}
 void radioPause(){if(!initialized)return;Guard l;want=false;if(enabled)state="paused";}
-void radioSeek(int32_t delta){if(!initialized)return;Guard l;if(selected<0||!bitrate||refresh)return;
+static bool radioSeekLocked(uint32_t pos){
+ if(!enabled||selected<0||selected>=(int)episodes.size()||refresh)return false;
+ if(episodes[selected].duration&&pos>=episodes[selected].duration)pos=episodes[selected].duration-1;
+ baseSec=pos;++generation;clearBuffer();state=want?"buffering":"paused";error="";return true;
+}
+void radioSeek(int32_t delta){if(!initialized)return;Guard l;
  int64_t pos=(int64_t)baseSec+played/RATE+delta;if(pos<0)pos=0;
- if(episodes[selected].duration&&pos>=(int64_t)episodes[selected].duration)pos=episodes[selected].duration-1;
- baseSec=(uint32_t)pos;++generation;clearBuffer();state=want?"buffering":"paused";error="";}
+ radioSeekLocked((uint32_t)pos);}
+bool radioSeekTo(uint32_t seconds){if(!initialized)return false;Guard l;return radioSeekLocked(seconds);}
 bool radioPlaying(){if(!initialized)return false;Guard l;return enabled&&want;}
 bool radioWantPlay(){if(!initialized)return false;Guard l;return enabled&&want&&!buffering&&fill>0;}
 uint32_t radioPull(int16_t* out,uint32_t maxSamples){
