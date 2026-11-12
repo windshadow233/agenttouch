@@ -83,4 +83,64 @@ class TimingTests(unittest.TestCase):
         d=H.mic_snapshot();d['startup']['total_ms']=999
         self.assertEqual(H._voice_startup_timing['total_ms'],123)
 
+class ReadyPromptTests(unittest.TestCase):
+    def setUp(self):
+        sleeper=patch.object(H.time,'sleep')
+        self.sleep=sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def test_prompt_is_dispatched_only_after_successful_shortcut(self):
+        for success in (True, None):
+            with self.subTest(success=success), \
+                 patch.object(H,'voice_key',return_value=success), \
+                 patch.object(H.threading,'Thread') as thread, \
+                 patch.object(H,'log'):
+                H.voice_start_timed(lambda:None,False,H.time.perf_counter())
+                if success:
+                    thread.assert_called_once_with(target=H.voice_ready_prompt,daemon=True)
+                    thread.return_value.start.assert_called_once()
+                else:
+                    thread.assert_not_called()
+
+    def test_prompt_plays_on_board_independent_of_voice_style(self):
+        with patch.object(H,'boards',{'board':object()}), \
+             patch.object(H,'voice_down',True),patch.object(H,'LANG','zh'), \
+             patch.object(H,'VOICE_STYLE','chirp'), \
+             patch.object(H,'tts_wav',return_value='ready.wav') as tts, \
+             patch.object(H,'speak_push') as push:
+            H.voice_ready_prompt()
+        tts.assert_called_once_with('请讲');push.assert_called_once_with('ready.wav')
+        self.sleep.assert_called_once_with(1.5)
+
+    def test_release_or_repress_during_delay_cancels_prompt(self):
+        for repress in (False,True):
+            def release(seconds):
+                H.voice_down=repress
+                H._voice_press_generation+=1
+            with self.subTest(repress=repress), \
+                 patch.object(H,'boards',{'board':object()}), \
+                 patch.object(H,'voice_down',True), \
+                 patch.object(H,'_voice_press_generation',1), \
+                 patch.object(H,'tts_wav') as tts:
+                self.sleep.side_effect=release
+                H.voice_ready_prompt()
+                tts.assert_not_called()
+
+    def test_release_during_synthesis_cancels_prompt(self):
+        def synth(text):
+            H.voice_down=False
+            return 'ready.wav'
+        with patch.object(H,'boards',{'board':object()}), \
+             patch.object(H,'voice_down',True), \
+             patch.object(H,'tts_wav',side_effect=synth),patch.object(H,'speak_push') as push:
+            H.voice_ready_prompt()
+        push.assert_not_called()
+
+    def test_no_prompt_after_release_or_without_tcp(self):
+        for down,boards in [(False,{'board':object()}),(True,{})]:
+            with patch.object(H,'voice_down',down),patch.object(H,'boards',boards), \
+                 patch.object(H,'tts_wav') as tts:
+                H.voice_ready_prompt()
+            tts.assert_not_called()
+
 if __name__=='__main__':unittest.main()
