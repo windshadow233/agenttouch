@@ -3,6 +3,7 @@
 // On-board episode player — see player.h for the container and the threading.
 #include "player.h"
 #include "audio.h"
+#include "radio.h"
 #include "sdcard.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -175,6 +176,7 @@ static void plLoadMeta() {
 
 // ------------------------------------------------------------------ api
 void playerSaveState() {
+  if (radioEnabled()) return;
   fs::FS* fs = sdFs();
   s_saveAt = millis();
   if (!fs || s_cur < 0 || s_cur >= s_n) return;
@@ -241,6 +243,7 @@ void playerRescan() {
 }
 
 void playerToggle() {
+  if (radioEnabled()) { radioToggle(); return; }
   if (s_n <= 0) return;
   if (s_want) { playerPause(); return; }
   if (s_cur < 0) { s_cur = 0; s_blk = 0; }
@@ -251,6 +254,7 @@ void playerToggle() {
 }
 
 void playerPause() {
+  if (radioEnabled()) { radioPause(); return; }
   if (!s_want) return;
   plSuspend();
   playerSaveState();
@@ -260,8 +264,8 @@ static void plSkip(int delta) {
   if (s_n <= 0) return;
   bool was = plSuspend();
   int nx = (s_cur < 0 ? 0 : s_cur) + delta;
-  if (nx < 0)    nx = 0;
-  if (nx >= s_n) nx = s_n - 1;
+  if (nx < 0)    nx = s_n - 1;
+  if (nx >= s_n) nx = 0;
   s_cur = nx;
   s_blk = 0;
   s_seekGen++;
@@ -270,13 +274,14 @@ static void plSkip(int delta) {
   else     playerSaveState();
 }
 
-void playerNext() { plSkip(+1); }
-void playerPrev() { plSkip(-1); }
+void playerNext() { if (radioEnabled()) radioSkip(+1); else plSkip(+1); }
+void playerPrev() { if (radioEnabled()) radioSkip(-1); else plSkip(-1); }
 
 // ±15 s from the compact card's side zones. Blocks are 1 s, so this is just
 // a block move; the stream notices the bumped seekGen at its next pull and
 // re-seeks inside the open file (no suspend needed for a seek).
 void playerSeek(int32_t dsec) {
+  if (radioEnabled()) { radioSeek(dsec); return; }
   if (s_n <= 0 || s_cur < 0) return;
   int32_t blk = (int32_t)s_blk + dsec;
   if (blk < 0) blk = 0;
@@ -287,12 +292,14 @@ void playerSeek(int32_t dsec) {
   if (!s_want) playerSaveState();
 }
 
-bool playerPlaying() { return s_want; }
-bool playerWantPlay() { return s_want; }
+bool playerRunning() { return s_running; }
+bool playerPlaying() { return radioEnabled() ? radioPlaying() : s_want; }
+bool playerWantPlay() { return radioEnabled() ? radioWantPlay() : s_want; }
 void playerRunSet(bool on) { s_running = on; }
-int  playerCount() { return s_n; }
+int  playerCount() { return radioEnabled() ? radioCount() : s_n; }
 
 const PlayerInfo& playerInfo() {
+  if (radioEnabled()) return radioInfo();
   gInfo.hasItems = s_n > 0;
   gInfo.playing  = s_want;
   gInfo.posSec   = s_blk;
@@ -303,6 +310,7 @@ const PlayerInfo& playerInfo() {
 // Metadata follows the stream's own auto-advance, and the resume point goes
 // down every 10 s so a yanked battery costs at most that.
 void playerPoll() {
+  if (radioEnabled()) { radioPoll(); return; }
   if (s_metaIdx != s_cur) plLoadMeta();
   if (s_want && (int32_t)(millis() - s_saveAt) > 10000) playerSaveState();
 }
@@ -356,6 +364,7 @@ static bool plBlock() {
 }
 
 uint32_t playerPull(int16_t* out, uint32_t maxSamples) {
+  if (radioEnabled()) return radioPull(out, maxSamples);
   if (!s_want || s_n <= 0 || !s_buf) return 0;
   if (s_openIdx != s_cur || s_openGen != s_seekGen) {
     while (!plOpen()) {                          // skip files that aren't containers
@@ -366,15 +375,17 @@ uint32_t playerPull(int16_t* out, uint32_t maxSamples) {
     }
     if (s_blk >= s_nblk) s_blk = 0;              // stale resume point
   }
+  uint32_t advances = 0;
   while (s_off >= s_bufSamp) {                   // this block is spent
     if (!plBlock()) {
-      if (s_cur + 1 < s_n) {                     // roll into the next episode
-        s_cur = s_cur + 1;
-        s_blk = 0;
-        s_openGen = s_seekGen;
-        if (plOpen()) continue;
-      }
-      s_want = false;                            // last one: stop where we are
+      // Loop the playlist at EOF, including a one-episode playlist. Bound
+      // empty-file traversal so damaged/empty entries cannot spin forever.
+      if (++advances > (uint32_t)s_n) { s_want = false; return 0; }
+      s_cur = (s_cur + 1) % s_n;
+      s_blk = 0;
+      s_openGen = s_seekGen;
+      if (plOpen()) continue;
+      s_want = false;
       return 0;
     }
   }

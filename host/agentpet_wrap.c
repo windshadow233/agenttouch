@@ -9,9 +9,11 @@ int main(void) {
     if (!home) return 1;
     char script[1024];
     snprintf(script, sizeof script, "%s/.agentpet/agentpet_host.py", home);
+    char python[1024];
+    snprintf(python, sizeof python, "%s/.agentpet/.venv/bin/python", home);
     pid_t pid = fork();
     if (pid == 0) {
-        execl("/usr/bin/python3", "python3", script, (char*)NULL);
+        execl(python, "python3", script, (char*)NULL);
         _exit(127);
     }
     int st = 0;

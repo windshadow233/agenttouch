@@ -895,7 +895,7 @@ class VoiceToFrontTests(unittest.TestCase):
                         "VOICE_SOURCE", "active_agent", "_voice_to_front")}
         self.raised, self.keys, self.lines, self.posted = [], [], [], []
         H.inject = lambda fn: fn()          # the worker, run inline
-        H.raise_agent_app = self.raised.append
+        H.raise_agent_app = lambda agent, **kwargs: self.raised.append(agent)
         H.voice_key = self.keys.append
         H.post_key = self.posted.append
         H._frontmost_app = lambda: "Notes|Notes"

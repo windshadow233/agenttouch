@@ -6,8 +6,7 @@
 # (Songti / Hiragino Sans GB / Menlo, ~1 s). Missing -> bake it before the
 # compile starts. Present -> leave it alone; after adding almanac words, run
 # the generator again by hand (or delete the file) and rebuild.
-# Uses /usr/bin/python3 like the host does, so the one Pillow that
-# host/setup.sh installs serves both.
+# Uses the uv-managed host environment, including its Pillow installation.
 import os
 import subprocess
 
@@ -19,9 +18,14 @@ gen = os.path.normpath(os.path.join(proj, "..", "host", "gen_almanac_font.py"))
 
 if not os.path.exists(out):
     print("almanac_font.h missing: baking it from this Mac's system fonts (%s)" % gen)
-    r = subprocess.run(["/usr/bin/python3", gen])
+    python = os.path.expanduser("~/.agentpet/.venv/bin/python")
+    if not os.path.isfile(python) or not os.access(python, os.X_OK):
+        print("\n*** host environment missing; run: bash host/setup.sh --pillow\n")
+        env.Exit(1)  # noqa: F821
+        raise SystemExit(1)
+    r = subprocess.run([python, gen])
     if r.returncode or not os.path.exists(out):
-        print("\n*** could not bake src/almanac_font.h. It needs Pillow for /usr/bin/python3:\n"
+        print("\n*** could not bake src/almanac_font.h. It needs Pillow in ~/.agentpet/.venv:\n"
               "***   host/setup.sh   (asks, then installs it; --pillow = yes without asking)\n"
-              "***   or: /usr/bin/python3 -m pip install --user pillow==11.3.0\n")
+              "***   or: uv pip install --python ~/.agentpet/.venv/bin/python pillow==11.3.0\n")
         env.Exit(1)  # noqa: F821

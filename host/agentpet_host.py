@@ -25,6 +25,7 @@ import email.utils
 import gc
 import hashlib
 import collections
+import concurrent.futures
 import json
 import os
 import queue
@@ -51,7 +52,7 @@ except ImportError:
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 # ------------------------------------------------------------------ config
 TCP_PORT = 8737          # board connects here
@@ -408,6 +409,8 @@ _host_key_at = 0.0           # last key event the host posted itself
 # voice button is held — matches WeChat IME's hold-fn-to-talk (and any IME
 # with a hold-fn voice mode). "fn_double" taps fn twice for Apple dictation.
 VOICE_MODE = "hold_fn"
+VOICE_SHORTCUT = "fn"             # editable in the web dictation settings
+_voice_pressed_shortcut = None    # latch at key-down; release this even after a settings change
 FN_KEYCODE = 63
 
 # Pickup page binding (doc/06 screen-sovereignty rules): what the board
@@ -593,6 +596,7 @@ board_part = None
 # firmware face.cpp SKIN_NAMES; the page's picker is built from SKIN_NAMES.
 board_skins = {}
 SKIN_NAMES = ["classic", "kitty", "robo", "bunny", "sprout", "grok"]
+board_radio_supported = False
 board_hello_at = 0.0     # when the last hello arrived (/ota waits for the post-reboot one)
 # The board's own vitals, refreshed by every hello and every ping (telemetry
 # firmware only -- an older board sends a bare {"t":"ping"} and a hello
@@ -624,7 +628,7 @@ def log(*a):
 def load_overrides():
     global FOCUS_FOLLOW, STRETCH_AFTER_MIN, PICKUP_PAGE, VOICE_STYLE, VOICE_SOURCE, MIC_SINK_DEVICE, MIC_TAIL_S
     global FOLLOW_FRONT, MIC_LINK, FOCUS_SETTLE_S, NOW_PLAYING, SHOW_OFF_SEATS
-    global NO_BOARD_RESTART_S, RSS_RESTART_MB, LANG
+    global NO_BOARD_RESTART_S, RSS_RESTART_MB, LANG, VOICE_SHORTCUT
     if CONFIG_OVERRIDE.exists():
         try:
             cfg = json.loads(CONFIG_OVERRIDE.read_text())
@@ -660,6 +664,10 @@ def load_overrides():
             PICKUP_PAGE = cfg.get("pickup_page", PICKUP_PAGE)
             VOICE_STYLE = cfg.get("voice_style", VOICE_STYLE)
             VOICE_SOURCE = cfg.get("voice_source", VOICE_SOURCE)
+            raw_shortcut = cfg.get("voice_shortcut", VOICE_SHORTCUT)
+            VOICE_SHORTCUT = voice_shortcut_clean(raw_shortcut) or "fn"
+            if voice_shortcut_clean(raw_shortcut) is None:
+                log("config: invalid voice_shortcut, using fn")
             MIC_SINK_DEVICE = cfg.get("mic_sink_device", MIC_SINK_DEVICE)
             MIC_TAIL_S = float(cfg.get("mic_tail_s", MIC_TAIL_S))
             # Not on the settings page (nobody should have to think about
@@ -1199,11 +1207,12 @@ def unread_tick(prev, snap):
     return False
 
 
-def raise_agent_app(agent, wait=0.5):
+def raise_agent_app(agent, wait=0.5, focus_input=False):
     """Focus insurance before typing/dictating into an agent's window (the
     user may have clicked elsewhere since focus follow ran): if the app is
     not frontmost, raise it, give the window server a beat, and re-press its
-    input-focus key. Zero delay when it is already front — the common case.
+    input-focus key. Voice input also reasserts input focus when the app is
+    already front; approval actions keep their existing card focus.
     Runs on the inject worker, never on a link thread: the BLE link handles
     messages inside bleak's asyncio callback, and the first version slept
     here for 0.5 s (10 s worst case on a stuck `open -a`) with the whole
@@ -1220,6 +1229,14 @@ def raise_agent_app(agent, wait=0.5):
         # for the Forest seat, so the approve Enter went to the wrong window
         # (2026-09-13 16:58)
         log("focus insurance:", app, "already front")
+        if focus_input:
+            keyspec = FOCUS_KEYS.get(agent)
+            if keyspec:
+                post_key(keyspec)
+                time.sleep(0.15)
+                log("voice input focus:", agent, "->", keyspec)
+            else:
+                log("voice input focus: no shortcut configured for", agent)
         return
     try:
         subprocess.run(["open", "-a", app], capture_output=True, timeout=2)
@@ -1339,18 +1356,56 @@ def _tap_fn_osascript(times):
     subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
     _host_key_stamp()
 
+def _post_voice_shortcut(spec, down):
+    if spec == "fn":
+        _post_fn(down)
+        return
+    parts = spec.split("+")
+    mods = {"cmd": Quartz.kCGEventFlagMaskCommand,
+            "shift": Quartz.kCGEventFlagMaskShift,
+            "alt": Quartz.kCGEventFlagMaskAlternate,
+            "option": Quartz.kCGEventFlagMaskAlternate,
+            "ctrl": Quartz.kCGEventFlagMaskControl}
+    flags = 0
+    for part in parts[:-1]:
+        flags |= mods[part]
+    with objc_pool():
+        ev = Quartz.CGEventCreateKeyboardEvent(None, KEYCODES[parts[-1]], bool(down))
+        Quartz.CGEventSetFlags(ev, flags if down else 0)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    _host_key_stamp()
+
 def voice_key(start: bool):
-    global voice_down
-    voice_down = bool(start)            # reverse focus follow freezes while held
+    global voice_down, _voice_pressed_shortcut
+    if start:
+        if _voice_pressed_shortcut is not None:
+            return                           # duplicate press: do not trigger twice
+        spec = voice_shortcut_clean(VOICE_SHORTCUT)
+        if spec is None:
+            log("voice key error: invalid shortcut")
+            return
+    else:
+        spec = _voice_pressed_shortcut
+        if spec is None:
+            voice_down = False
+            return
     try:
-        if VOICE_MODE == "hold_fn" and _HAVE_QUARTZ:
-            _post_fn(start)
-            log(f"voice: fn {'DOWN (hold)' if start else 'UP (release)'}")
+        if spec == "fn" and (VOICE_MODE != "hold_fn" or not _HAVE_QUARTZ):
+            _tap_fn_osascript(2 if start else 1)  # retain legacy fn fallback
+        elif _HAVE_QUARTZ:
+            _post_voice_shortcut(spec, bool(start))
         else:
-            _tap_fn_osascript(2 if start else 1)
-            log(f"voice: fn tapped ({'start' if start else 'stop'})")
+            log("voice key error: Quartz unavailable")
+            return
+        _voice_pressed_shortcut = spec if start else None
+        voice_down = bool(start)             # reverse focus follow freezes while held
+        log("voice:", spec, "DOWN (hold)" if start else "UP (release)")
     except Exception as e:
         log("voice key error:", e)
+    finally:
+        if not start:
+            _voice_pressed_shortcut = None
+            voice_down = False
 
 # ------------------------------------------------------------------ key injection
 # Board-side "voice remote": {"t":"key","k":"enter"} presses Return (send the
@@ -1364,6 +1419,8 @@ KEYCODES = {  # macOS virtual keycodes (US layout)
     "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35, "enter": 36,
     "l": 37, "j": 38, "k": 40, "n": 45, "m": 46, "tab": 48, "space": 49,
     "esc": 53,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+    "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
 }
 
 KEY_MODS = ("cmd", "shift", "alt", "option", "ctrl")
@@ -1387,6 +1444,20 @@ def key_spec_ok(spec):
     if parts[-1] not in KEYCODES:
         return False
     return all(part in KEY_MODS for part in parts[:-1])
+
+def voice_shortcut_clean(spec):
+    """Validate the web dictation shortcut without sending any key events."""
+    if not isinstance(spec, str) or len(spec) > 64:
+        return None
+    spec = spec.strip().lower()
+    if spec == "fn":
+        return spec
+    if not key_spec_ok(spec):
+        return None
+    mods = ["alt" if p == "option" else p for p in spec.split("+")[:-1]]
+    if len(mods) != len(set(mods)):
+        return None
+    return spec
 
 def post_key(spec):
     """spec: "enter", "cmd+z", "cmd+shift+l", ..."""
@@ -3104,18 +3175,88 @@ def mic_input_set(name):
         return None
     return r.stdout.strip()
 
+_mic_setup_timing = {}
+_voice_startup_timing = {}
+
 def mic_sink_begin():
-    """Route the pet's mic to the input method: sink up, BlackHole as default
-    input. Returns True when the path is ready (else the Mac mic is used)."""
-    if mic_sink_proc() is None:
-        return False
-    prev = mic_input_set(MIC_SINK_DEVICE)
-    if prev is None:
-        return False
+    """Prepare the mic route, recording helper startup and device-switch time."""
+    t0 = time.perf_counter()
+    helper = mic_sink_proc()
+    t1 = time.perf_counter()
+    prev = mic_input_set(MIC_SINK_DEVICE) if helper is not None else None
+    t2 = time.perf_counter()
     with _mic_lock:
-        if _mic["prev_input"] is None and prev.lower() != MIC_SINK_DEVICE.lower():
+        _mic_setup_timing.clear()
+        _mic_setup_timing.update(helper_ms=round((t1-t0)*1000, 1),
+                                 switch_ms=round((t2-t1)*1000, 1))
+        if prev is not None and _mic["prev_input"] is None and prev.lower() != MIC_SINK_DEVICE.lower():
             _mic["prev_input"] = prev
-    return True
+    return helper is not None and prev is not None
+
+# Only route preparation runs here. Window focus and key injection stay on
+# the original single injection worker, preserving start/stop ordering.
+_voice_prepare_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="voice-mic-prepare")
+
+def _prepare_voice_mic():
+    began = time.perf_counter()
+    try:
+        ok = mic_sink_begin()
+    except Exception as exc:
+        log("mic prepare error:", exc)
+        ok = False
+    elapsed = (time.perf_counter()-began)*1000
+    with _mic_lock:
+        setup = dict(_mic_setup_timing)
+    return ok, elapsed, setup
+
+def voice_start_timed(focus, board_mic, received_at, link=""):
+    """Overlap mic preparation with focus; join both before dispatching keys."""
+    began = time.perf_counter()
+    future = _voice_prepare_pool.submit(_prepare_voice_mic) if board_mic else None
+    focus_at = time.perf_counter()
+    try:
+        focus()
+    except Exception:
+        # Do not leave a background job switching to BlackHole after the
+        # failed start has returned. Join it and restore any acquired route.
+        if future is not None:
+            try:
+                if future.result()[0]:
+                    mic_sink_end()
+            except Exception as exc:
+                log("mic prepare cleanup error:", exc)
+        raise
+    focused = time.perf_counter()
+    ok, mic_ms, setup = future.result() if future is not None else (True, 0, {})
+    prepared = time.perf_counter()
+    voice_key(True)
+    triggered = time.perf_counter()
+    if board_mic and ok:
+        mic_sink_open_gate()
+    finished = time.perf_counter()
+    timing = {"at": round(time.time(), 3), "source": "board" if board_mic else "mac",
+              "parallel": bool(board_mic),
+              "queue_ms": round((began-received_at)*1000, 1),
+              "mic_ms": round(mic_ms, 1),
+              "focus_ms": round((focused-focus_at)*1000, 1),
+              "prepare_ms": round((prepared-began)*1000, 1),
+              "wait_mic_ms": round((prepared-focused)*1000, 1),
+              "key_ms": round((triggered-prepared)*1000, 1),
+              "gate_ms": round((finished-triggered)*1000, 1),
+              "to_shortcut_ms": round((triggered-received_at)*1000, 1),
+              "total_ms": round((finished-received_at)*1000, 1),
+              "route_ok": ok, "shortcut": VOICE_SHORTCUT}
+    with _mic_lock:
+        if board_mic:
+            timing.update(mic_helper_ms=setup.get("helper_ms", 0),
+                          mic_switch_ms=setup.get("switch_ms", 0))
+        _voice_startup_timing.clear()
+        _voice_startup_timing.update(timing)
+    if board_mic:
+        log("voice: board mic (%s) ->" % link, MIC_SINK_DEVICE if ok else "FAILED, Mac mic")
+    log("voice startup:", json.dumps(timing, ensure_ascii=False))
+
 
 def mic_sink_open_gate():
     with _mic_lock:
@@ -3148,7 +3289,8 @@ def mic_snapshot():
                 "peak": _mic["peak"], "rms": _mic["rms"], "sink_bytes": _mic["sink_bytes"],
                 "sink": _sink_proc is not None and _sink_proc.poll() is None,
                 "gate": _mic["sink_gate"], "board": _mic["board"], "stat": _mic["stat"],
-                "source": VOICE_SOURCE, "sink_device": MIC_SINK_DEVICE, "tail_s": MIC_TAIL_S}
+                "source": VOICE_SOURCE, "sink_device": MIC_SINK_DEVICE, "tail_s": MIC_TAIL_S,
+                "startup": dict(_voice_startup_timing)}
 
 def mic_record(seconds):
     """Capture `seconds` of the board mic into ~/.agentpet/mic/rec_<ts>.wav (16 kHz mono)."""
@@ -3347,7 +3489,7 @@ def tcp_card_pushes():
 
 def handle_board_msg(raw, reply):
     global active_agent, board_sd, board_sd_at, board_rtc, board_rtc_at, board_rtc_boot
-    global board_build, board_part, board_hello_at, board_select_at, _board_min_floor, board_skins
+    global board_build, board_part, board_hello_at, board_select_at, _board_min_floor, board_skins, board_radio_supported
     try:
         m = json.loads(raw)
     except ValueError:
@@ -3364,6 +3506,7 @@ def handle_board_msg(raw, reply):
         board_stat_update(m)
         reply(b'{"t":"pong"}\n')
     elif t == "hello":
+        board_radio_supported = bool(m.get("radio", False))
         log("board hello:", m)
         board_hello_at = time.time()
         _board_min_floor = None       # a rebooted board starts its own descent
@@ -3414,7 +3557,7 @@ def handle_board_msg(raw, reply):
         threading.Thread(target=media_cmd, args=(m.get("cmd", ""),), daemon=True).start()
     elif t == "np_miss":                 # the board wants a cover that is not on the card
         threading.Thread(target=np_miss, args=(m.get("cover", ""),), daemon=True).start()
-    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst"):   # answers to SD file / OTA / speak / rtt / player endpoints
+    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst", "netradio"):   # answers to SD file / OTA / speak / rtt / player endpoints
         _park_reply(m)
     elif t == "skins":            # who wears what, after a change on the card or from /test/skin
         if isinstance(m.get("skins"), dict):   # same key as on the hello
@@ -3464,6 +3607,7 @@ def handle_board_msg(raw, reply):
         start = m.get("a") == "start"
         agent = m.get("agent") or active_agent
         if start:
+            received_at = time.perf_counter()
             board_mic = VOICE_SOURCE == "board" and bool(m.get("mic"))
             # {"to":"front"} — the board is on a desk page (clock / almanac),
             # where dictation is for whatever the user is typing in right now,
@@ -3485,24 +3629,10 @@ def handle_board_msg(raw, reply):
                 elif voice_sid:
                     focus_session_fast(voice_sid)   # that session's own tab
                 else:
-                    raise_agent_app(agent)
+                    raise_agent_app(agent, wait=0.15, focus_input=True)
 
-            if board_mic:
-                # route A: sink up + BlackHole as default input BEFORE fn goes
-                # down; frames that arrived meanwhile are flushed once it is
-                def go():
-                    ok = mic_sink_begin()
-                    focus()
-                    voice_key(True)
-                    if ok:
-                        mic_sink_open_gate()
-                    log("voice: board mic (%s) ->" % m.get("link", "?"), MIC_SINK_DEVICE if ok else "FAILED, Mac mic")
-                inject(go)
-            else:
-                # the user may have clicked another window since focus follow ran
-                # (2026-09-01 gap): dictation must land in the agent's input box.
-                # Queued, not inline — see inject()
-                inject(lambda: (focus(), voice_key(True)))
+            # Prepare mic and focus concurrently; dispatch the shortcut only after both finish.
+            inject(lambda: voice_start_timed(focus, board_mic, received_at, m.get("link", "")))
         else:
             with _mic_lock:
                 board_mic = _mic["session_board"]
@@ -5220,7 +5350,7 @@ def tts_wav(text, voice=None):
     mp3 = wav_path.with_suffix(".mp3")
     try:
         r = subprocess.run(
-            ["/usr/bin/python3", "-m", "edge_tts", "-v", voice,
+            [sys.executable, "-m", "edge_tts", "-v", voice,
              "-t", text, "--write-media", str(mp3)],
             capture_output=True, timeout=25)
         if r.returncode != 0 or not mp3.exists():
@@ -6919,6 +7049,30 @@ def au_status():
     return {"job": job, "queue": q, "busy": bool(job or q), "done": done,
             "tcp": au_has_tcp(), "pending": [n for n in au_names() if n not in au_pushed()]}
 
+def radio_request(op, feed=""):
+    """Initial configuration only; the board fetches RSS and MP3 itself."""
+    if op not in ("status", "config", "disable"):
+        return {"ok": False, "why": "unknown radio operation"}
+    if not board_radio_supported:
+        return {"ok": False, "supported": False, "why": tr("请先烧录支持独立 RSS 播放的新版固件", "Update the board firmware for standalone RSS playback")}
+    payload = {"t": "netradio", "op": op, "id": _new_rid()}
+    if op == "config":
+        if not isinstance(feed, str) or len(feed) > 1023:
+            return {"ok": False, "why": "invalid RSS URL"}
+        feed = feed.strip()
+        try:
+            parsed = urlsplit(feed)
+            valid = parsed.scheme in ("http", "https") and bool(parsed.hostname) and not parsed.username and not parsed.password and not any(c.isspace() for c in feed)
+        except ValueError:
+            valid = False
+        if not valid:
+            return {"ok": False, "why": tr("请输入 HTTP(S) RSS 地址", "Enter an HTTP(S) RSS URL")}
+        payload.update(feed=parsed.geturl(), enabled=True)
+    if not (_ble_client is not None or au_has_tcp()):
+        return {"ok": False, "why": tr("配置时需连接板子，播放时无需连接 Mac", "Connect the board to configure it; playback does not need this Mac")}
+    push_board(payload)
+    return wait_reply("netradio", payload["id"], 5) or {"ok": False, "why": tr("板子未回复", "No response from board")}
+
 # ------------------------------------------------------------------ settings page
 # http://127.0.0.1:8788/settings — the third tier of the settings hierarchy
 # (gesture-direct on board / board settings card / Mac). Set-once mechanism
@@ -6931,6 +7085,8 @@ def au_status():
 # Values under data-th keys are trusted HTML (they carry <code>).
 SETTINGS_T = {
  "zh": {
+  "radio_title": "板子独立联网播客", "radio_hint": "首次配置 RSS 后，板子自己联网刷新和播放，Mac 可以关闭。播放页保持原样，刷新和选集在板子上操作。当前支持 MP3 音频，不保存整集到 SD 卡。", "radio_feed": "RSS 订阅地址", "radio_save": "保存并启用", "radio_load": "读取板子设置", "radio_sd": "使用 SD 卡播客", "radio_sd_title": "下载到 SD 卡（原有方式）", "radio_idle": "连接板子后读取或保存 RSS 设置",
+
   "title": "AgentTouch 设置", "lang_saved": "语言：中文",
   "loading": "读取中", "loading_dots": "读取中……", "board": "板子",
   "page_overview": "总览", "pdesc_overview": "host 与板子此刻好不好，五个席位在干什么。",
@@ -7000,6 +7156,7 @@ SETTINGS_T = {
   "vs_chirp": "滴滴", "vs_tts": "晓伊说话",
   "vol": "音量", "vol_sub": "直接写板端 NVS，0 = 静音",
   "say_t": "让宠物说点什么", "say_sub": "晓伊 TTS，要 Wi-Fi 在线", "say_ph": "输入一句……", "play": "播放",
+  "voice_key": "语音快捷键", "voice_key_hint": "默认 fn。按下右键时按下此键，松开时释放；组合键松开时不会再次触发。请与输入法或听写设置一致。", "voice_key_ph": "fn / option+z / ctrl+shift+space",
   "mic_src": "声音从哪来", "mic_hint_ok": "按住板子右键说话时",
   "mic_hint_no": "板子上的麦要先编 mic_sink：swiftc -O -o ~/.agentpet/mic_sink host/mic_sink.swift",
   "mic_mac": "Mac 的麦", "mic_board": "板子的麦",
@@ -7051,6 +7208,8 @@ SETTINGS_T = {
   "saved": "已保存 {0} 项：{1}", "save_fail": "保存失败：", "no_host": "读不到 host：",
  },
  "en": {
+  "radio_title": "Standalone Wi-Fi podcasts", "radio_hint": "Configure RSS once. The board fetches episodes and plays MP3 over Wi-Fi without this Mac or saving entire episodes to SD. Refresh and choose episodes on the board; playback controls stay the same.", "radio_feed": "RSS feed URL", "radio_save": "Save and enable", "radio_load": "Read board settings", "radio_sd": "Use SD podcasts", "radio_sd_title": "Download to SD (existing mode)", "radio_idle": "Connect the board to read or save its RSS settings",
+
   "title": "AgentTouch Settings", "lang_saved": "Language: English",
   "loading": "Loading", "loading_dots": "Loading…", "board": "Board",
   "page_overview": "Overview", "pdesc_overview": "How the host and the board are doing, and what the five seats are up to.",
@@ -7120,6 +7279,7 @@ SETTINGS_T = {
   "vs_chirp": "Chirp", "vs_tts": "Voice",
   "vol": "Volume", "vol_sub": "Written straight to the board. 0 = mute.",
   "say_t": "Make the Pet Say Something", "say_sub": "Aria text-to-speech. Needs Wi-Fi.", "say_ph": "Type a sentence…", "play": "Play",
+  "voice_key": "Dictation shortcut", "voice_key_hint": "Default: fn. Pressing the right button holds this shortcut; releasing it releases the keys without tapping again. Match your input method or dictation settings.", "voice_key_ph": "fn / option+z / ctrl+shift+space",
   "mic_src": "Microphone", "mic_hint_ok": "While you hold the board's right key",
   "mic_hint_no": "The board mic needs mic_sink built first: swiftc -O -o ~/.agentpet/mic_sink host/mic_sink.swift",
   "mic_mac": "Mac Mic", "mic_board": "Board Mic",
@@ -7246,9 +7406,9 @@ header p{margin:6px 0 0;font-size:13px;color:rgba(255,255,255,.62);max-width:640
 .seg button.on{background:#3a3a3c;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.6)}
 .seg button i{width:6px;height:6px;border-radius:50%;display:inline-block}
 .seg.dis{opacity:.4;pointer-events:none}
-input[type=text],input[type=password],input[type=number],select,textarea{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);
+input[type=text],input[type=url],input[type=password],input[type=number],select,textarea{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);
  border-radius:8px;color:#f2f2f2;font:13px "SF Mono",Menlo,monospace;padding:6px 10px;min-height:30px;outline:0}
-input[type=text]:focus,input[type=password]:focus,input[type=number]:focus,select:focus,textarea:focus{border-color:#0a84ff}
+input[type=text]:focus,input[type=url]:focus,input[type=password]:focus,input[type=number]:focus,select:focus,textarea:focus{border-color:#0a84ff}
 input[type=text]{width:220px}
 input.w{width:300px;font-family:-apple-system,"PingFang SC",sans-serif}
 input.g{flex:1;width:auto;font-family:-apple-system,"PingFang SC",sans-serif}
@@ -7380,6 +7540,7 @@ footer .sp{flex:1}
 
  <div class="page" data-page="mic">
   <section><div class="grp">
+   <div class="row"><div class="lab"><label for="voice_shortcut" data-t="voice_key"></label><small data-t="voice_key_hint"></small></div><input type="text" class="w" id="voice_shortcut" maxlength="64" value="fn" data-tp="voice_key_ph" autocomplete="off" spellcheck="false"></div>
    <div class="row"><div class="lab"><span data-t="mic_src"></span><small id="vs_hint" data-t="mic_hint_ok"></small></div>
     <div class="seg" id="vs2"><label><input type="radio" name="vsrc" id="vs_mac" value="mac"><span data-t="mic_mac"></span></label><label id="vs_board_l"><input type="radio" name="vsrc" id="vs_board" value="board"><span data-t="mic_board"></span></label></div></div>
    <div class="row"><div class="lab"><span data-t="ml_t"></span><small data-t="ml_sub"></small></div>
@@ -7414,6 +7575,12 @@ footer .sp{flex:1}
  </div>
 
  <div class="page" data-page="audio">
+  <section><div class="grp">
+   <div class="row"><div class="lab"><span data-t="radio_title"></span><small data-t="radio_hint"></small></div></div>
+   <div class="row" style="flex-wrap:wrap"><label for="radiofeed" data-t="radio_feed"></label><input type="url" class="g" id="radiofeed" placeholder="https://feeds.daopub.com/ld.xml" autocomplete="off"><button type="button" class="pri sm" onclick="radioConfig()" data-t="radio_save"></button></div>
+   <div class="row" style="flex-wrap:wrap"><button type="button" class="sm" onclick="radioLoad(true)" data-t="radio_load"></button><button type="button" class="sm" onclick="radioDisable()" data-t="radio_sd"></button><div class="lab"><small id="radiostatus" data-t="radio_idle"></small></div></div>
+  </div></section>
+  <section><div class="row"><div class="lab" data-t="radio_sd_title"></div></div></section>
   <section><div class="grp">
    <div class="row" style="min-height:60px"><input type="text" class="g" id="au" data-tp="au_ph">
     <select id="aun"><option value="1" data-t="au_n1"></option><option value="3" data-t="au_n3"></option><option value="5" data-t="au_n5"></option></select>
@@ -7496,6 +7663,7 @@ function route(){let h=(location.hash||'#overview').slice(1);
  document.querySelectorAll('.page').forEach(e=>e.className='page'+(e.dataset.page===p?' on':''));
  $('#hd_t').textContent=t('page_'+p);$('#hd_d').textContent=t('pdesc_'+p);
  if(p==='wifi')wfLoad();
+ if(p==='audio')radioLoad(true);
  if(p==='seats')scLoad()}
 buildNav();window.addEventListener('hashchange',()=>{route();$('.content').scrollTop=0});route();
 // ---- language: repaint every marked node in place; typed-in values survive ----
@@ -7522,12 +7690,14 @@ function touch(){const b=$('#save');b.disabled=false;b.className='pri';tx($('#sa
 function clean(){const b=$('#save');b.disabled=true;b.className='';const h=$('#savehint');delete h.dataset.t;h.textContent=''}
 function onEdit(e){const t=e.target;
  if(!t.matches||!t.matches('input,select,textarea'))return;
- if(['vol','logn','sayt','au','aun','wfs','wfp'].indexOf(t.id)>=0)return;  // board NVS / log / one-shot boxes
+ if(['vol','logn','sayt','au','aun','radiofeed','wfs','wfp'].indexOf(t.id)>=0)return;  // board NVS / log / one-shot boxes
  if(t.name==='pk'||t.name==='lang')return;                     // written on click
  if(t.dataset.k==='focus_apps')mirrorApp(t);
  touch()}
 document.addEventListener('input',onEdit);
 document.addEventListener('change',onEdit);
+
+
 // ---- the seat rows (expandable) + CPU field, built once in the host's seat order ----
 function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
 function field(k,a,ph){const e=el('input');e.type='text';e.dataset.k=k;e.dataset.a=a;
@@ -7670,6 +7840,7 @@ function fill(d){
  $('#st').value=d.stretch_after_min;$('#fs').value=d.focus_settle_s;
  $('#np').checked=!!d.np_enabled;
  $('#msd').value=d.mic_sink_device||'';$('#mts').value=d.mic_tail_s;
+ $('#voice_shortcut').value=d.voice_shortcut||'fn';
  $(d.voice_source==='board'?'#vs_board':'#vs_mac').checked=true;
  $('#vs_board').disabled=!d.mic_sink_ok;
  $('#vs_board_l').className=d.mic_sink_ok?'':'off';
@@ -7805,6 +7976,14 @@ function auTick(){fetch(API+'/audio/status').then(r=>r.json()).then(d=>{
  if(d.busy!==auBusy||auN%4===0){auBusy=d.busy;auList()}
  auN++}).catch(()=>{})}
 auTick();setInterval(auTick,3000);
+function radioPaint(d,fill){const e=$('#radiostatus');delete e.dataset.t;
+ e.textContent=d.ok?[d.enabled?'RSS / Wi-Fi':'SD',d.state,d.count==null?'':d.count+' episodes',d.buffer_s==null?'':'buffer '+Number(d.buffer_s).toFixed(1)+' s',d.error].filter(Boolean).join(' · '):(d.why||'Not available');
+ if(d.ok&&fill)$('#radiofeed').value=d.feed||''}
+function radioLoad(fill=false){fetch(API+'/radio/status').then(r=>r.json()).then(d=>radioPaint(d,fill)).catch(e=>{$('#radiostatus').textContent=String(e)})}
+function radioConfig(){const feed=$('#radiofeed').value.trim();if(!feed)return;
+ fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'config',feed})}).then(r=>r.json()).then(d=>{radioPaint(d,true);toast(d.ok?t('saved').replace('{0}','1').replace('{1}','RSS'):(d.why||'Failed'))}).catch(e=>toast(String(e)))}
+function radioDisable(){fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'disable'})}).then(r=>r.json()).then(d=>radioPaint(d,true)).catch(e=>toast(String(e)))}
+
 // ---- host memory trend: its own slow timer (30 s), the line is SVG ----
 function memTick(){fetch(API+'/host/mem').then(r=>r.json()).then(d=>{
  const pts=d.pts||[];
@@ -7848,6 +8027,7 @@ function save(){
   focus_apps:seatMap('focus_apps'),focus_keys:seatMap('focus_keys'),
   approve_keys:seatMap('approve_keys'),reject_keys:seatMap('reject_keys'),
   proc_rules:pr,cpu_working:cpuMap(),
+  voice_shortcut:$('#voice_shortcut').value.trim(),
   voice_source:$('#vs_board').checked?'board':'mac',
   mic_sink_device:$('#msd').value,mic_tail_s:+$('#mts').value};
  fetch(API+'/settings/save',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -7957,6 +8137,11 @@ def save_settings(patch):
     key spec must not leave half a save behind."""
     vs = patch.get("voice_style")
     clean = {}
+    if "voice_shortcut" in patch:
+        shortcut = voice_shortcut_clean(patch["voice_shortcut"])
+        if shortcut is None:
+            return {"ok": False, "why": tr("语音快捷键无效，例如 fn、option+z、ctrl+shift+space", "Invalid dictation shortcut; try fn, option+z or ctrl+shift+space")}
+        clean["voice_shortcut"] = shortcut
     if vs in ("chirp", "tts"):
         clean["voice_style"] = vs
     if isinstance(patch.get("focus_follow"), bool):
@@ -8139,6 +8324,7 @@ class HookHandler(BaseHTTPRequestHandler):
                 "proc_rules": dict(PROC_RULES),
                 "cpu_working": dict(CPU_WORKING),
                 "voice_source": VOICE_SOURCE,
+                "voice_shortcut": VOICE_SHORTCUT,
                 "mic_link": MIC_LINK,
                 "mic_sink_device": MIC_SINK_DEVICE,
                 "mic_tail_s": MIC_TAIL_S,
@@ -8245,6 +8431,8 @@ class HookHandler(BaseHTTPRequestHandler):
                                     ensure_ascii=False).encode())
             else:
                 self._ok(json.dumps(np_snapshot(), ensure_ascii=False).encode())
+        elif self.path == "/radio/status":
+            self._ok(json.dumps(radio_request("status"), ensure_ascii=False).encode())
         elif self.path.startswith("/audio/"):
             # 听什么: RSS / audio link / local file -> the card
             #   /audio/add?url=<feed or audio>[&n=1] | /audio/add?file=/abs/path
@@ -8719,6 +8907,10 @@ class HookHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw or b"{}")
         except ValueError:
             payload = {}
+        if self.path == "/radio/config":
+            r = radio_request(payload.get("op", "config"), payload.get("feed", "")) if isinstance(payload, dict) else {"ok": False, "why": "need JSON object"}
+            self._ok(json.dumps(r, ensure_ascii=False).encode())
+            return
         if self.path == "/settings/save":
             self._ok(json.dumps(save_settings(payload), ensure_ascii=False).encode())
             return

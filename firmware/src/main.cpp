@@ -17,6 +17,7 @@
 #include <mbedtls/base64.h>
 #include <lwip/sockets.h>
 #include <errno.h>
+#include <new>
 #include "pins.h"
 #include "config.h"
 #include "face.h"
@@ -27,6 +28,7 @@
 #include "sdfont.h"
 #include "boardrtc.h"
 #include "player.h"
+#include "radio.h"
 #include "jpegrom.h"
 #include "i18n.h"
 #include "esp_rom_crc.h"
@@ -678,13 +680,12 @@ static void playAct(uint8_t src, int zone) {
 // device-validated for the two-sided pages).
 static void pageXY(int x, int y, int& px, int& py) {
   switch ((4 - shownRot) & 3) {
-    // Canvas rotations 1 and 3 are exactly 180° apart, so this row is the
-    // point reflection of the device-validated case 3 below. The clock
-    // strip moved here on 2026-09-09 (PAGES_BY_ORIENT); the old `py = x`
-    // had never run — the play page lived at rotation 3 until then.
-    case 1:  px = 479 - y; py = 479 - x; break;
+    // Inverse of Arduino_GFX's canvas rotation: convert native touch
+    // coordinates back into the frame used to draw the transport buttons.
+    // The previous odd-rotation rows mirrored px, swapping left and right.
+    case 1:  px = y;       py = 479 - x; break;
     case 2:  px = 479 - x; py = 479 - y; break;
-    case 3:  px = y;       py = x;       break;   // observed on device 2026-09-09 morning (user-validated zones)
+    case 3:  px = 479 - y; py = x;       break;
     default: px = x;       py = y;       break;
   }
 }
@@ -1688,6 +1689,20 @@ static void handleLine(const String& line) {
     if (on) npCoverCheck(cover);
   } else if (strcmp(t, "pl") == 0) {        // host: /agentpet/audio/ changed
     playerRescan();
+  } else if (strcmp(t, "netradio") == 0) {
+    const char* op = d["op"] | "status";
+    bool ok = true;
+    if (!strcmp(op,"config")) {
+      playerPause();
+      ok = radioConfigure(d["feed"] | "", d["enabled"] | false);
+    } else if (!strcmp(op,"disable")) radioDisable();
+    else if (!strcmp(op,"refresh")) radioRefresh();
+    else if (!strcmp(op,"select")) radioSelect(d["index"] | 0,true);
+    else if (!strcmp(op,"pause")) radioPause();
+    else if (strcmp(op,"status")) ok=false;
+    JsonDocument r;r["t"]="netradio";r["id"]=d["id"] | 0;r["ok"]=ok;
+    radioStatus(r.as<JsonObject>());
+    sendJson(r);
   } else if (strcmp(t, "play") == 0) {      // host debug (/test/play/<cmd>[&src=mac]): drive a page
     // Same helpers the tap zones run. Default target is the board player;
     // "src":"mac" routes to the Mac (that is the user's player — mind it).
@@ -2170,32 +2185,130 @@ static bool almanacFromCard(uint32_t localEpoch) {
 static const size_t RX_LINE_MAX = 4096;
 static String rxBuf;
 static bool   rxOverflow = false;     // current TCP line already too long
+// Address lookup and TCP connect may wait seconds. Only this worker performs
+// them; it owns a private client until the loop adopts a completed result.
+struct NetDialTarget {
+  String owner, mdns, fallback, ssid;
+  uint16_t port;
+  IPAddress local;
+};
+struct NetDialJob {
+  NetDialTarget target;
+  WiFiClient client;
+  bool ok = false;
+};
+static portMUX_TYPE netDialMux = portMUX_INITIALIZER_UNLOCKED;
+static bool netDialRunning = false;
+static NetDialJob* netDialResult = nullptr;
+
+static bool netDialBusy() {
+  portENTER_CRITICAL(&netDialMux);
+  bool running = netDialRunning;
+  portEXIT_CRITICAL(&netDialMux);
+  return running;
+}
+
+static NetDialJob* netDialTake() {
+  portENTER_CRITICAL(&netDialMux);
+  NetDialJob* result = netDialResult;
+  netDialResult = nullptr;
+  portEXIT_CRITICAL(&netDialMux);
+  return result;
+}
+
+static bool netDialSame(const NetDialTarget& a, const NetDialTarget& b) {
+  return a.owner == b.owner && a.mdns == b.mdns && a.fallback == b.fallback &&
+         a.port == b.port && a.local == b.local && a.ssid == b.ssid;
+}
+
+static void netDialWorker(void* arg) {
+  NetDialJob* job = static_cast<NetDialJob*>(arg);
+  IPAddress ip;
+  ip.fromString(job->target.fallback.c_str());
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP() == job->target.local && WiFi.SSID() == job->target.ssid) {
+    if (job->target.mdns.length()) {
+      IPAddress resolved = MDNS.queryHost(job->target.mdns.c_str(), 1500);
+      if (resolved != IPAddress()) ip = resolved;
+    }
+    if (ip != IPAddress() && WiFi.status() == WL_CONNECTED &&
+        WiFi.localIP() == job->target.local && WiFi.SSID() == job->target.ssid) {
+      job->ok = job->client.connect(ip, job->target.port, 1000) != 0;
+    }
+  }
+  portENTER_CRITICAL(&netDialMux);
+  netDialResult = job;
+  netDialRunning = false;
+  portEXIT_CRITICAL(&netDialMux);
+  // Do not touch job after publication: the loop now owns it.
+  vTaskDelete(nullptr);
+}
+
+static bool netDialStart(const NetDialTarget& target) {
+  if (netDialBusy()) return false;
+  NetDialJob* job = new (std::nothrow) NetDialJob;
+  if (!job) return false;
+  job->target = target;
+  portENTER_CRITICAL(&netDialMux);
+  // A completed result must be consumed before creating another request.
+  bool occupied = netDialRunning || netDialResult != nullptr;
+  if (!occupied) netDialRunning = true;
+  portEXIT_CRITICAL(&netDialMux);
+  if (occupied) { delete job; return false; }
+  if (xTaskCreatePinnedToCore(netDialWorker, "host-connect", 6144, job, 1, nullptr, 0) != pdPASS) {
+    portENTER_CRITICAL(&netDialMux);
+    netDialRunning = false;
+    portEXIT_CRITICAL(&netDialMux);
+    delete job;
+    return false;
+  }
+  return true;
+}
+
+static NetDialTarget netDialTarget() {
+  bool owned = ownerId.length() > 0;
+  NetDialTarget t;
+  t.owner = ownerId;
+  t.mdns = owned ? ownerMdns : String(HOST_MDNS_NAME);
+  t.fallback = owned ? ownerIp : String(HOST_FALLBACK_IP);
+  t.port = owned ? ownerPort : HOST_PORT;
+  t.local = WiFi.localIP();
+  t.ssid = WiFi.SSID();
+  return t;
+}
+
 static void netPoll() {
   uint32_t now = millis();
 
+  // Consume completed work without waiting. Reject results from an old
+  // Wi-Fi address or a previous owner, and release their private sockets.
+  bool adopted = false;
+  NetDialJob* result = netDialTake();
+  if (result) {
+    if (WiFi.status() == WL_CONNECTED && !sock.connected() && result->ok &&
+        netDialSame(result->target, netDialTarget())) {
+      sock = result->client;             // NetworkClient shares ownership of its handle
+      txPendLen = txPendOff = 0;          // no bytes from the old connection may cross over
+      adopted = true;
+      Serial.println("net: background connect ready");
+    } else {
+      Serial.println("net: background connect failed or stale");
+    }
+    delete result;
+  }
   if (WiFi.status() != WL_CONNECTED) { hostUp = false; return; }
-
   if (!sock.connected()) {
     if (hostUp) Serial.println("net: link dropped");
     hostUp = false;
     static uint32_t lastTry = 0;
-    if (now - lastTry < 3000) return;
+    if (netDialBusy() || (int32_t)(now - lastTry) < 3000) return;
     lastTry = now;
     sock.stop();
-    // Owner Mac when there is one, else the config.local.h Mac.
-    IPAddress ip;
-    bool owned = ownerId.length() > 0;
-    if (!owned && !HOST_FALLBACK_IP[0] && !HOST_MDNS_NAME[0]) return;   // public build, not claimed yet
-    ip.fromString(owned ? ownerIp.c_str() : HOST_FALLBACK_IP);
-    const char* mdns = owned ? ownerMdns.c_str() : HOST_MDNS_NAME;
-    uint16_t port = owned ? ownerPort : HOST_PORT;
-    if (*mdns) {
-      IPAddress m = MDNS.queryHost(mdns, 1500);
-      if (m != IPAddress()) ip = m;
-    }
-    if (ip == IPAddress()) return;       // owner never told us an address yet
-    Serial.printf("net: connecting %s:%d\n", ip.toString().c_str(), port);
-    if (!sock.connect(ip, port)) { Serial.println("net: connect failed"); return; }
+    NetDialTarget target = netDialTarget();
+    if (!target.owner.length() && !target.fallback.length() && !target.mdns.length()) return;
+    if (!netDialStart(target)) Serial.println("net: could not schedule background connect");
+    return;                              // no mDNS wait or TCP connect in the loop
+  }
+  if (adopted) {
     sock.setNoDelay(true);
     rxBuf = ""; rxOverflow = false;
     lastRx = now;
@@ -2210,6 +2323,7 @@ static void netPoll() {
     d["sel"] = AGENTS[selected].id;
     d["sd"] = sdInfo().mounted ? sdInfo().sizeMB : 0; d["sdrw"] = sdInfo().rwOk;
     d["rtc"] = rtcInfo().bootEpoch;      // 0 = chip had no usable time at boot
+    d["radio"] = true;
     d["build"] = FW_BUILD; d["part"] = esp_ota_get_running_partition()->label;
     d["owner"] = ownerName;
     addSkins(d);                                            // who wears what
@@ -2330,7 +2444,7 @@ static void wifiPoll() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiOkAt = now;
     wifiParked = false;      // an add from the Mac can bring the radio up mid-park
-    if (mdnsRedo) {          // parked: mDNS was stopped with the radio (see below)
+    if (mdnsRedo && !netDialBusy()) { // never tear down mDNS while a worker is querying
       mdnsRedo = false;      // (netPoll falls back to the fixed IP anyway)
       MDNS.end();
       MDNS.begin("agentpet");
@@ -2346,6 +2460,7 @@ static void wifiPoll() {
     // grace expired and the latest probe window came up empty -> park
     if ((int32_t)(now - wifiOkAt) > GRACE_MS &&
         (int32_t)(now - wifiProbeAt) > PROBE_MS) {
+      if (netDialBusy()) return;          // defer radio/mDNS teardown; never wait here
       wifiParked = true;
       wifiProbeAt = now;
       mdnsRedo = true;
@@ -2633,6 +2748,7 @@ static int tpStartX = 0, tpStartY = 0;   // press-down point
 static int tpLastX  = 0, tpLastY  = 0;   // latest point while held
 static uint32_t tpDownAt = 0;            // press-down time (long-press actions)
 static bool tpConsumed = false;          // hold already acted; release is a no-op
+static int tpPodHoldZone = 0;           // latched podcast side button; 0 = ineligible
 static int8_t  petDir     = 0;           // dominant-axis stroke dir while held (±1 x, ±2 y)
 static uint8_t petStrokes = 0;           // direction reversals in this touch
 
@@ -2688,6 +2804,26 @@ static int sessTopHalf(int x, int y) {
   return vx < 240 ? -1 : 1;
 }
 
+// Podcast side-button hold: switch one episode, never repeat or seek on release.
+static void podcastHoldPoll(int x, int y) {
+  if (!tpPodHoldZone || tpConsumed || radioListVisible()) return;
+  int px, py;
+  pageXY(x, y, px, py);
+  if (shownPage != PAGE_CLOCK || clockView != CV_POD || claimShowing() ||
+      listening || demoStart || playZoneAt(px, py) != tpPodHoldZone ||
+      abs(x - tpStartX) >= 24 || abs(y - tpStartY) >= 24) {
+    tpPodHoldZone = 0;                  // leaving the button/dragging cancels this hold
+    return;
+  }
+  if ((int32_t)(millis() - tpDownAt) < 700) return;
+  int zone = tpPodHoldZone;
+  tpPodHoldZone = 0;
+  tpConsumed = true;                    // do not seek +/-15 s when the finger lifts
+  if (zone < 0) playerPrev(); else playerNext();
+  audioPlay(SND_TICK);
+  noteActivity();
+}
+
 static void touchPoll() {
   if (!tpOk) return;
   if ((pendH || pendV) && (int32_t)(millis() - pendAt) > 300) execPendingSwipe();
@@ -2711,6 +2847,13 @@ static void touchPoll() {
       tpStartX = x; tpStartY = y;
       tpDownAt = millis();
       tpConsumed = false;
+      tpPodHoldZone = 0;
+      if (shownPage == PAGE_CLOCK && clockView == CV_POD && !claimShowing() &&
+          !listening && !demoStart) {
+        int px, py;
+        pageXY(x, y, px, py);
+        tpPodHoldZone = playZoneAt(px, py);
+      }
       noteActivity();
     }
     // petting = back-and-forth rubbing, either axis, lifts allowed: the
@@ -2743,6 +2886,7 @@ static void touchPoll() {
       }
     }
     tpLastX = x; tpLastY = y;
+    podcastHoldPoll(x, y);
 
     // hold ~1.5 s on the face = settings card. The approve bubble keeps its
     // own long-press (reject), so the hold is inert while needs_you is up
@@ -2807,7 +2951,7 @@ static void touchPoll() {
         else if (hit == 1)   claimResolve(true, "tap");
       }
     } else if (tpConsumed) {
-      tpConsumed = false;    // the hold already opened the settings card
+      tpConsumed = false;    // the hold already opened settings or switched an episode
     } else if (shownPage == PAGE_FACE &&
                (int32_t)(setCardUntil - millis()) > 0) {
       // settings card owns the touch: taps pick, anything else dismisses
@@ -2936,8 +3080,11 @@ static void touchPoll() {
       // 1 and 3 of the table are 180° twins, so the inversion carries over —
       // flip on both odd rotations.
       int up = (((4 - shownRot) & 3) & 1) ? (vdy > 0) : (vdy < 0);
-      audioSetVolume(audioVolume() + (up ? 10 : -10));
-      volShowUntil = millis() + 1500;
+      if(clockView==CV_POD&&radioListVisible())radioListStep(up?1:-1);
+      else {
+        audioSetVolume(audioVolume() + (up ? 10 : -10));
+        volShowUntil = millis() + 1500;
+      }
       audioPlay(SND_TICK);
     } else if (shownPage == PAGE_CLOCK && clockView != CV_CLOCK &&
                !vh && !hswipe && !vswipe) {
@@ -2951,7 +3098,8 @@ static void touchPoll() {
         lastPlayTapAt = nowMs;
         int px, py;
         pageXY(tpLastX, tpLastY, px, py);
-        playAct(pageSrc(), playZoneAt(px, py));
+        if (!(pageSrc()==PSRC_SD && radioPageTap(px,py)))
+          playAct(pageSrc(), playZoneAt(px, py));
         audioPlay(SND_TICK);
       }
     } else if ((shownPage == PAGE_CALENDAR ||
@@ -3092,6 +3240,7 @@ void setup() {
   // then the card fonts (any glyph missing in flash comes from there)
   if (sdInit()) { sdFontLoadAll(); almanacFromCard(clockEpoch()); }
   playerInit();     // scan /agentpet/audio/ + restore the resume point
+  radioInit();      // independent RSS fetch / MP3 decode worker; no Mac needed
 
   // Growth stats + skin, loaded before the boot animation so the eyes
   // already wear the chosen skin while they open
@@ -3366,7 +3515,8 @@ void loop() {
       d["sel"] = AGENTS[selected].id;                       // seat we woke up on, see the TCP hello
       d["sd"] = sdInfo().mounted ? sdInfo().sizeMB : 0; d["sdrw"] = sdInfo().rwOk;
       d["rtc"] = rtcInfo().bootEpoch;
-      d["build"] = FW_BUILD; d["part"] = esp_ota_get_running_partition()->label;
+      d["radio"] = true;
+    d["build"] = FW_BUILD; d["part"] = esp_ota_get_running_partition()->label;
       d["owner"] = ownerName;
       addSkins(d);
       sendJson(d);

@@ -129,3 +129,28 @@ the grok skin's eye shapes come from [nasawz/GrokBot](https://github.com/nasawz/
 the ES8311 / ES7210 codec setup derives from [espressif/esp-bsp](https://github.com/espressif/esp-bsp) (Apache-2.0);
 the sounds' pitch contours come from `sing()` in [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib);
 the intro video's music is original, played with instruments from [GeneralUser GS](https://www.schristiancollins.com/generaluser) by S. Christian Collins.
+
+
+### Python 环境（uv）
+
+先安装 uv，再运行 `bash host/setup.sh --pillow`。安装脚本使用系统
+`/usr/bin/python3` 创建 `~/.agentpet/.venv`，由 uv 安装固定版本的依赖，
+不再使用 `pip --user`。后台应用直接使用该环境，不需要激活。
+首次从旧版迁移会重建应用，可能需要在系统设置中重新授予蓝牙权限；
+防火墙放行按脚本提示操作。安装脚本不会自动下载其他 Python。
+
+开发时可运行：
+
+```bash
+source ~/.agentpet/.venv/bin/activate
+python host/test_host.py -v
+deactivate
+```
+
+`bash host/setup.sh --check` 仅检查；环境尚未创建时会提示并退出，
+依赖检查以离线方式进行，缺少缓存时可能无法完成解析。
+
+
+### 板子独立 RSS 播客
+
+支持由板子通过 Wi-Fi 直接刷新 RSS、解析 MP3 直链并缓冲播放，无需 Mac 持续连接，也不保存整集到 SD 卡。初次通过设置页配置 RSS，刷新和选集在板子原有播客页操作。需更新固件。详见 [独立 RSS 播放说明](doc/07-standalone-rss.zh-CN.md)。

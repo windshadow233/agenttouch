@@ -4,7 +4,7 @@ An ESP32-S3-Touch-AMOLED-2.16 desk pet whose face shows the state of Claude Code
 
 ## Hard rules
 
-- Run the Mac service with **`/usr/bin/python3`** only. The firewall lets only that binary in; any other Python is blocked and the board cannot connect.
+- The Mac service uses **`~/.agentpet/.venv/bin/python`**, managed by uv and based on **`/usr/bin/python3`**. Do not substitute a downloaded Python. `host/setup.sh` installs dependencies and reports firewall grants for the venv, its real executable and base Python.app. The first migration rebuilds the app and may require renewed Bluetooth permission.
 - `firmware/platformio.ini` is the public one (official library names, pinned). When downloads are slow, override `lib_deps` in `firmware/platformio.local.ini` (gitignored), **`lib_deps` only**: a different `platform` line re-downloads the whole toolchain. `config.local.h` (gitignored) holds your own Wi-Fi / Mac; **after editing it, `touch firmware/src/config.h` before building**, or it won't recompile.
 - uint32 time comparisons in the firmware are always `(int32_t)(millis() - ts) > N` (no underflow).
 - The board writes to TCP **only through `tcpWriteLine` / `tcpWriteLines`** (a single line gets its newline added, a batch must end with a newline, a half-written batch is always finished). Never a bare `sock.print` / `sock.write` / `send()`. **Line lengths always come from `sizeof` / `strlen`, never counted by hand.** **After touching the TCP or BLE send path, run the regression pair**: read `/test/badlines` → `/test/shot?s=1` plus a 10 s dictation session (`/test/mic/start` … `/stop`) → read `/test/badlines` again; the difference must be 0.

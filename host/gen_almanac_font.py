@@ -49,7 +49,8 @@ HIRAGINO = system_font("/System/Library/Fonts/Hiragino Sans GB.ttc")
 MENLO = system_font("/System/Library/Fonts/Menlo.ttc")
 # Fixed strings the play pages draw in the 18 px face (baked into flash so the
 # pages are legible even before the card font is in).
-PLAY_UI_CHARS = ("正在播放播客第集共上没有的还卡节目里点什么就会出现这在设置页听贴一个或文件"
+PLAY_UI_CHARS = ("刷新列表返回加载网络重试播放中暂停上一页下一页"
+                 "正在播放播客第集共上没有的还卡节目里点什么就会出现这在设置页听贴一个或文件"
                  "网易云音乐浏览器苹果视频哔哩暂停继续下一曲上一曲秒剩余 ·Mac"
                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-:/.,()…")
 ONLY = set()   # --sd <dir> --only tiny18 : bake just the named faces

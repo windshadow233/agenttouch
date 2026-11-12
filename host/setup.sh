@@ -30,14 +30,18 @@ APP="$HOME/Applications/AgentPetHost.app"
 LABEL=com.agentpet.host
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
-PY=/usr/bin/python3                     # the only python the firewall lets in (CLAUDE.md 铁律)
+BASE_PY=/usr/bin/python3               # keep the existing system Python as the base
+PY="$BASE_PY"
+VENV="$DEPLOY/.venv"
+UV=$(command -v uv 2>/dev/null || true)
+[ -n "$UV" ] || { [ ! -x "$HOME/.local/bin/uv" ] || UV="$HOME/.local/bin/uv"; }
 PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # pyobjc 11.1, not 12: 12.0 was yanked for claiming Python 3.9 support, so on
 # /usr/bin/python3 (3.9) pip falls back to its source tarball, which a newer
 # clang refuses to build (second Mac, 2026-09-26). 11.1 has 3.9 wheels for
 # arm64 and x86_64; host tests pass on it. --only-binary keeps pip from ever
 # compiling: a missing wheel fails fast instead of 16 errors deep.
-PIP_PKGS="bleak==1.1.1 pyobjc-core==11.1 pyobjc-framework-Quartz==11.1 pyobjc-framework-Cocoa==11.1 pyobjc-framework-CoreBluetooth==11.1 pyobjc-framework-libdispatch==11.1 edge-tts==7.2.8"
+PIP_PKGS="bleak==1.1.1 pyobjc-core==11.1 pyobjc-framework-Quartz==11.1 pyobjc-framework-Cocoa==11.1 pyobjc-framework-CoreBluetooth==11.1 pyobjc-framework-libdispatch==11.1 edge-tts==7.3.1"
 
 CHECK=0; IMPORT=""; REBUILD=0; PILLOW=0
 while [ $# -gt 0 ]; do
@@ -75,23 +79,43 @@ ok "python $("$PY" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')（${P
 ok "macOS $(sw_vers -productVersion)"
 
 # ---------------------------------------------------------------------------
-step "2. Python 依赖（装在 $PY 的 --user 里）"
-missing=$("$PY" - <<'EOF'
-import importlib.util as u
-need = {"bleak": "bleak", "Quartz": "pyobjc-framework-Quartz", "AppKit": "pyobjc-framework-Cocoa",
-        "edge_tts": "edge-tts"}
-print(" ".join(p for m, p in need.items() if u.find_spec(m) is None))
+step "2. Python 依赖（uv 管理 ${VENV}）"
+if [ -z "$UV" ]; then
+  bad "找不到 uv；请先安装 uv 后重跑 setup.sh"
+  exit 1
+fi
+if [ ! -x "$VENV/bin/python" ]; then
+  if [ $CHECK = 1 ]; then
+    warn "（--check）会创建 $VENV 并安装依赖；尚无环境，无法完成检查"
+    exit 1
+  fi
+  mkdir -p "$DEPLOY" || exit 1
+  "$UV" --no-config venv --no-project --no-python-downloads --python "$BASE_PY" "$VENV" || exit 1
+  CHANGED_HOST=1
+fi
+PY="$VENV/bin/python"
+base_exe=$("$BASE_PY" -c 'import os,sys;print(os.path.realpath(sys._base_executable))')
+if ! "$PY" - "$base_exe" <<'EOF'
+import os, sys
+base = os.path.realpath(sys.argv[1])
+if sys.prefix == sys.base_prefix or os.path.realpath(sys._base_executable) != base:
+    sys.exit("环境不是基于 /usr/bin/python3 的 venv；请先备份并移走 ~/.agentpet/.venv 后重试")
 EOF
-)
-if [ -z "$missing" ]; then
-  ok "bleak / pyobjc / edge-tts 都在"
+then
+  bad "虚拟环境检查失败"; exit 1
+fi
+# uv checks pinned versions as well as installing missing dependencies.
+if [ $CHECK = 1 ]; then
+  "$UV" --no-config pip install --dry-run --offline --no-cache --no-python-downloads --python "$PY" \
+    --only-binary=:all: --default-index "$PIP_INDEX" $PIP_PKGS || FAIL=1
 else
-  warn "缺：$missing"
-  if doit "pip install --user $PIP_PKGS"; then
-    echo "  （过程记在 /tmp/agentpet_setup_pip.log）"
-    if "$PY" -m pip install --user -q --disable-pip-version-check --no-warn-script-location --only-binary=:all: \
-         -i "$PIP_INDEX" $PIP_PKGS >/tmp/agentpet_setup_pip.log 2>&1; then did "已安装"
-    else bad "pip 失败（网络？换源或挂代理再试；tail /tmp/agentpet_setup_pip.log）"; FAIL=1; fi
+  echo "  （过程记在 /tmp/agentpet_setup_pip.log）"
+  if "$UV" --no-config pip install --no-python-downloads --python "$PY" --only-binary=:all: \
+       --default-index "$PIP_INDEX" $PIP_PKGS >/tmp/agentpet_setup_pip.log 2>&1; then
+    did "uv 已检查并安装依赖"
+    if grep -qE "^(Installed|Uninstalled) " /tmp/agentpet_setup_pip.log; then CHANGED_HOST=1; fi
+  else
+    bad "uv 安装失败（tail /tmp/agentpet_setup_pip.log）"; exit 1
   fi
 fi
 # Pillow does one job: bake the Chinese fonts from this Mac's own system fonts
@@ -109,10 +133,10 @@ else
   fi
   case "$ans" in
     y|Y|yes|YES)
-      if "$PY" -m pip install --user -q --disable-pip-version-check --no-warn-script-location --only-binary=:all: \
-           -i "$PIP_INDEX" $PIL_PKG >>/tmp/agentpet_setup_pip.log 2>&1; then did "Pillow 已安装"
+      if "$UV" --no-config pip install --no-python-downloads --python "$PY" --only-binary=:all: \
+           --default-index "$PIP_INDEX" $PIL_PKG >>/tmp/agentpet_setup_pip.log 2>&1; then did "Pillow 已安装"; CHANGED_HOST=1
       else bad "Pillow 没装上（tail /tmp/agentpet_setup_pip.log）"; FAIL=1; fi ;;
-    *) MANUAL+=("装 Pillow（生成中文字库要它，编译固件前必须装）：$PY -m pip install --user $PIL_PKG（或重跑 host/setup.sh --pillow）") ;;
+    *) MANUAL+=("装 Pillow（生成中文字库要它，编译固件前必须装）：uv pip install --python \"$PY\" ${PIL_PKG}（或重跑 host/setup.sh --pillow）") ;;
   esac
 fi
 
@@ -150,9 +174,10 @@ fi
 step "4. 外壳 AgentPetHost.app（launchd 下拿蓝牙权限的唯一办法）"
 have_app=0
 [ -x "$APP/Contents/MacOS/agentpet-host" ] && grep -q NSBluetoothAlwaysUsageDescription "$APP/Contents/Info.plist" 2>/dev/null && have_app=1
-if [ $have_app = 1 ] && [ $REBUILD = 0 ]; then
+if [ $have_app = 1 ] && [ $REBUILD = 0 ] && [ -f "$APP/Contents/Resources/uv-venv-v1" ]; then
   ok "已存在，保留（重签会让蓝牙授权失效；要重建用 --rebuild-app）"
 elif doit "编译 agentpet_wrap.c、组装并签名 $APP"; then
+  [ $have_app = 0 ] || warn "切换到 uv 环境需要重建应用；蓝牙权限可能需要重新授予"
   tmp=$(mktemp -d)
   if clang -O2 -o "$tmp/agentpet-host" "$SRC/agentpet_wrap.c"; then
     mkdir -p "$APP/Contents/MacOS"
@@ -173,11 +198,15 @@ elif doit "编译 agentpet_wrap.c、组装并签名 $APP"; then
 </dict>
 </plist>
 EOF
-    if codesign --force -s - "$APP" 2>/dev/null; then did "已编译并 ad-hoc 签名"
-    else bad "codesign 失败"; FAIL=1; fi
+    # Resource markers must live in Resources, not the executable-code area.
+    rm -f "$APP/Contents/uv-venv-v1"
+    mkdir -p "$APP/Contents/Resources"
+    touch "$APP/Contents/Resources/uv-venv-v1"
+    if codesign --force -s - "$APP" && codesign --verify --strict "$APP"; then did "已编译并 ad-hoc 签名"
+    else bad "codesign 失败"; rm -f "$APP/Contents/Resources/uv-venv-v1"; exit 1; fi
     NEW_APP=1
   else
-    bad "clang 编译失败"; FAIL=1
+    bad "clang 编译失败"; exit 1
   fi
   rm -rf "$tmp"
 fi
@@ -255,7 +284,7 @@ step "8. Codex（ChatGPT.app）"
 if [ ! -d "$HOME/.codex" ] && [ ! -d /Applications/ChatGPT.app ] && ! command -v codex >/dev/null; then
   ok "本机没有 Codex，跳过"
 else
-  mkdir -p "$HOME/.codex" 2>/dev/null
+  [ $CHECK = 1 ] || mkdir -p "$HOME/.codex" 2>/dev/null
   # 8a. PermissionRequest hook (approval -> needs_you); merge, keep other hooks
   r=$("$PY" - "$HOME/.codex/hooks.json" "$DEPLOY/codex_permission_hook.sh" "$CHECK" <<'EOF'
 import json, sys, os, shutil, time
@@ -345,10 +374,11 @@ step "10. 防火墙（板子要从 Wi-Fi 连进 8737）"
 FW=/usr/libexec/ApplicationFirewall/socketfilterfw
 if ! $FW --getglobalstate 2>/dev/null | grep -q 'enabled'; then ok "防火墙没开"
 else
-  real="$("$PY" -c 'import sys;print(sys.prefix)')/Resources/Python.app"
+  real="$("$PY" -c 'import sys;print(sys.base_prefix)')/Resources/Python.app"
   apps=$($FW --listapps 2>/dev/null)
   need=()
-  for p in /usr/bin/python3 "$real"; do
+  actual=$("$PY" -c 'import os,sys;print(os.path.realpath(sys.executable))')
+  for p in /usr/bin/python3 "$PY" "$actual" "$real"; do
     [ -e "$p" ] || continue
     echo "$apps" | grep -qF "$p" && ok "已放行 $p" || need+=("$p")
   done
@@ -358,7 +388,7 @@ else
       # hand the exact commands to the user instead of failing a good install
       warn "没有终端，输不了管理员密码：放行留到最后给你手动做"
       for p in "${need[@]}"; do
-        MANUAL+=("防火墙放行 $p（板子要从 Wi-Fi 连进 8737；要管理员密码，请在终端里自己运行）：sudo $FW --add \"$p\" && sudo $FW --unblockapp \"$p\"")
+        MANUAL+=("防火墙放行 ${p}（板子要从 Wi-Fi 连进 8737；要管理员密码，请在终端里自己运行）：sudo $FW --add \"$p\" && sudo $FW --unblockapp \"$p\"")
       done
     elif doit "sudo 放行 ${need[*]}"; then
       echo "  放行要管理员密码："

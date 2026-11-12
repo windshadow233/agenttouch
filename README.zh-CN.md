@@ -129,3 +129,8 @@ grok 皮肤的眼形数据来自 [nasawz/GrokBot](https://github.com/nasawz/Grok
 音频芯片 ES8311 / ES7210 的初始化序列源自 [espressif/esp-bsp](https://github.com/espressif/esp-bsp)（Apache-2.0）；
 提示音的情绪音调取自 [OttoDIY/OttoDIYLib](https://github.com/OttoDIY/OttoDIYLib) 的 `sing()`；
 介绍视频的配乐是原创的，乐器音色来自 S. Christian Collins 的 [GeneralUser GS](https://www.schristiancollins.com/generaluser)。
+
+
+### 板子独立 RSS 播客
+
+支持由板子通过 Wi-Fi 直接刷新 RSS、解析 MP3 直链并缓冲播放，无需 Mac 持续连接，也不保存整集到 SD 卡。初次通过设置页配置 RSS，刷新和选集在板子原有播客页操作。需更新固件。详见 [独立 RSS 播放说明](doc/07-standalone-rss.zh-CN.md)。
