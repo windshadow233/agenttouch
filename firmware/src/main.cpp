@@ -1302,6 +1302,14 @@ static String   wifiNear[WIFI_NEAR_MAX];
 static int16_t  wifiNearRssi[WIFI_NEAR_MAX];
 static int      wifiNearN = 0;
 
+// The drawer owns touch and rotation until dismissed.
+static bool wifiDrawer = false, wifiEditing = false, wifiJoining = false;
+static bool wifiShowPass = false;
+static uint8_t wifiKeyMode = 0, wifiDrawerRot = 0;
+static int wifiListOffset = 0;
+static String wifiTarget, wifiInput, wifiNotice;
+static uint32_t wifiJoinAt = 0;
+
 static void wifiLoad() {
   wifiPrefs.begin("wifinet", false);
   wifiN = 0;
@@ -1400,6 +1408,155 @@ static void wifiHandle(JsonDocument& d) {
   } else {
     wifiReply(id, true, nullptr);
   }
+}
+
+// Wi-Fi drawer: a merged saved/nearby list and an ASCII password keyboard.
+static int wifiKnown(const String& ssid) {
+  for (int i=0;i<wifiN;i++) if (wifiSsid[i]==ssid) return i;
+  return kFactoryWifi && ssid==WIFI_SSID ? WIFI_NETS_MAX : -1;
+}
+static int wifiRows(String* rows) {
+  int n=0;
+  if (WiFi.status()==WL_CONNECTED) rows[n++]=WiFi.SSID();
+  for (int i=0;i<wifiN;i++) {
+    bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiSsid[i]) found=true;
+    if(!found) rows[n++]=wifiSsid[i];
+  }
+  if(kFactoryWifi) {
+    bool found=false; for(int j=0;j<n;j++) if(rows[j]==WIFI_SSID) found=true;
+    if(!found) rows[n++]=WIFI_SSID;
+  }
+  for(int i=0;i<wifiNearN;i++) {
+    bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiNear[i]) found=true;
+    if(!found) rows[n++]=wifiNear[i];
+  }
+  return n;
+}
+static void wifiDrawerJoin() {
+  if(wifiScanning) { wifiNotice=langEn()?"Wait for scan":"请等待扫描完成"; return; }
+  if(wifiInput.length() && (wifiInput.length()<8 || wifiInput.length()>63)) {
+    wifiNotice=langEn()?"Password: 8-63 characters":"密码需要 8-63 个字符"; return;
+  }
+  WiFi.disconnect(false);
+  WiFi.begin(wifiTarget.c_str(),wifiInput.c_str());
+  wifiJoining=true; wifiJoinAt=millis();
+  wifiNotice=langEn()?"Connecting...":"正在连接…";
+}
+static void wifiDrawerPoll() {
+  if(!wifiJoining) return;
+  if(WiFi.status()==WL_CONNECTED && WiFi.SSID()==wifiTarget) {
+    // Commit only credentials that actually connected; preserve factory entry.
+    if(wifiKnown(wifiTarget)!=WIFI_NETS_MAX) {
+      String ns[WIFI_NETS_MAX],np[WIFI_NETS_MAX];
+      ns[0]=wifiTarget; np[0]=wifiInput; int n=1;
+      for(int i=0;i<wifiN && n<WIFI_NETS_MAX;i++)
+        if(wifiSsid[i]!=wifiTarget) {ns[n]=wifiSsid[i];np[n++]=wifiPass[i];}
+      wifiN=n;
+      for(int i=0;i<WIFI_NETS_MAX;i++) {wifiSsid[i]=ns[i];wifiPass[i]=np[i];wifiSeen[i]=0;}
+      wifiSave();
+    }
+    wifiJoining=false;wifiEditing=false;wifiInput="";
+    wifiNotice=langEn()?"Connected":"已连接";
+  } else if((int32_t)(millis()-wifiJoinAt)>20000) {
+    wifiJoining=false;WiFi.disconnect(false);
+    wifiNotice=langEn()?"Failed. Check password and retry":"连接失败，请检查密码后重试";
+  }
+}
+static const char* wifiKeyRows[3][4]={
+  {"1234567890","qwertyuiop","asdfghjkl","zxcvbnm"},
+  {"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM"},
+  {"!@#$%^&*()","-_=+[]{}\\|",";:'\",.<>/?","`~"}
+};
+static void wifiUiText(Arduino_Canvas* c,int x,int y,const char* text,uint16_t color) {
+  almanacPrintSmall(c,x,y,text,color,0x0841);
+}
+static void wifiDrawerDraw(Arduino_Canvas* c) {
+  const uint16_t bg=0x0841,fg=0xFFFF,muted=0x9CF3,accent=0x5EBD;
+  c->fillScreen(bg);
+  c->fillRoundRect(210,12,60,5,2,muted);
+  wifiUiText(c,58,48,"Wi-Fi",fg);
+  wifiUiText(c,300,48,wifiEditing?(langEn()?"Back":"返回"):(langEn()?"Scan":"扫描"),accent);
+  wifiUiText(c,398,48,langEn()?"Close":"关闭",muted);
+  String status=wifiNotice;
+  if(wifiJoining) status=langEn()?"Connecting...":"正在连接…";
+  else if(wifiScanning) status=langEn()?"Scanning...":"正在扫描…";
+  else if(!status.length()) status=WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():(langEn()?"Choose a network":"选择一个网络");
+  char fitted[128];almanacFit(fitted,sizeof(fitted),status.c_str(),364,true);
+  wifiUiText(c,58,79,fitted,muted);
+  if(!wifiEditing) {
+    String rows[WIFI_NETS_MAX+WIFI_NEAR_MAX+2];int n=wifiRows(rows);
+    if(wifiListOffset>max(0,n-4))wifiListOffset=max(0,n-4);
+    for(int r=0;r<4 && r+wifiListOffset<n;r++) {
+      String ssid=rows[r+wifiListOffset];int y=100+r*75;
+      c->drawRoundRect(48,y,384,68,12,0x3186);
+      almanacFit(fitted,sizeof(fitted),ssid.c_str(),344,true);
+      wifiUiText(c,66,y+27,fitted,fg);
+      bool connected=WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid;
+      const char* label=connected?(langEn()?"Connected":"已连接"):wifiKnown(ssid)>=0?(langEn()?"Saved":"已记住"):(langEn()?"Nearby":"附近网络");
+      int rssi=0;for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==ssid)rssi=wifiNearRssi[i];
+      String detail=label;if(rssi)detail+="  "+String(rssi)+" dBm";
+      wifiUiText(c,66,y+53,detail.c_str(),connected?accent:muted);
+    }
+    if(!n)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
+    wifiUiText(c,100,435,langEn()?"Swipe to browse / up at top to close":"滑动浏览 · 顶部上滑关闭",muted);
+    return;
+  }
+  almanacFit(fitted,sizeof(fitted),wifiTarget.c_str(),364,true);wifiUiText(c,58,111,fitted,fg);
+  String password=wifiInput;
+  if(!wifiShowPass){password="";for(unsigned i=0;i<wifiInput.length();i++)password+='*';}
+  while(almanacTextWidthSmall(password.c_str())>270)password.remove(0,1);
+  c->drawRoundRect(48,125,384,44,10,0x3186);
+  wifiUiText(c,60,153,password.length()?password.c_str():(langEn()?"Password (empty for open)":"密码（开放网络留空）"),fg);
+  wifiUiText(c,372,153,wifiShowPass?"Hide":"Show",accent);
+  for(int r=0;r<4;r++) {
+    const char* keys=wifiKeyRows[wifiKeyMode][r];int count=strlen(keys);
+    for(int k=0;k<count;k++) {
+      int x=40+k*40,y=182+r*48;
+      c->fillRoundRect(x,y,37,43,6,0x2104);
+      char key[2]={keys[k],0};wifiUiText(c,x+11,y+29,key,fg);
+    }
+  }
+  const char* buttons[]={wifiKeyMode==1?"abc":"ABC","#+=","Space","Del"};
+  for(int i=0;i<4;i++) {
+    c->fillRoundRect(40+i*100,378,96,38,7,0x2104);
+    wifiUiText(c,50+i*100,404,buttons[i],fg);
+  }
+  c->fillRoundRect(100,424,280,38,12,0x236B);
+  const char* connectLabel=langEn()?"Connect":"连接";
+  wifiUiText(c,240-almanacTextWidthSmall(connectLabel)/2,450,connectLabel,fg);
+}
+static void wifiDrawerTap(int x,int y) {
+  if(y<60) {
+    if(x>=390){wifiDrawer=false;if(!wifiJoining)wifiInput="";}
+    else if(x>=290 && !wifiJoining) {
+      if(wifiEditing){wifiEditing=false;wifiInput="";wifiNotice="";}
+      else {wifiNotice="";wifiStartScan();}
+    }
+    return;
+  }
+  if(wifiJoining)return;
+  if(!wifiEditing) {
+    if(x<48||x>=432||y<100||y>=400)return;
+    int r=(y-100)/75;if((y-100)%75>=68)return;
+    String rows[WIFI_NETS_MAX+WIFI_NEAR_MAX+2];int n=wifiRows(rows);r+=wifiListOffset;
+    if(r>=n)return;
+    wifiTarget=rows[r];int known=wifiKnown(wifiTarget);
+    wifiInput=known==WIFI_NETS_MAX?String(WIFI_PASS):known>=0?wifiPass[known]:String();
+    wifiEditing=true;wifiShowPass=false;wifiKeyMode=0;wifiNotice="";
+    if(known>=0)wifiDrawerJoin();
+  } else if(y>=125&&y<169&&x>=360)wifiShowPass=!wifiShowPass;
+  else if(y>=182&&y<374&&x>=40&&x<440) {
+    int r=(y-182)/48,k=(x-40)/40;
+    const char* keys=wifiKeyRows[wifiKeyMode][r];
+    if(k<(int)strlen(keys)&&wifiInput.length()<63)wifiInput+=keys[k];
+  } else if(y>=378&&y<416&&x>=40&&x<440) {
+    switch((x-40)/100) {
+      case 0:wifiKeyMode=wifiKeyMode==1?0:1;break;
+      case 1:wifiKeyMode=wifiKeyMode==2?0:2;break;
+      case 2:if(wifiInput.length()<63)wifiInput+=' ';break;
+      case 3:if(wifiInput.length())wifiInput.remove(wifiInput.length()-1);break;
+    }
+  } else if(y>=424&&y<462&&x>=100&&x<380)wifiDrawerJoin();
 }
 
 // ---- Owner Mac ----
@@ -2439,13 +2596,14 @@ static void wifiPoll() {
     WiFi.scanDelete();
     Serial.printf("wifi: scan %d nets, best known %s (%d dBm)\n", n,
                   best == -2 ? "-" : best < 0 ? WIFI_SSID : wifiSsid[best].c_str(), best == -2 ? 0 : bestRssi);
-    if (best != -2 && WiFi.status() != WL_CONNECTED) {
+    if (!wifiJoining && best != -2 && WiFi.status() != WL_CONNECTED) {
       if (best < 0) WiFi.begin(WIFI_SSID, WIFI_PASS);
       else WiFi.begin(wifiSsid[best].c_str(), wifiPass[best].c_str());
     }
     if (wifiReplyId >= 0) { wifiReply(wifiReplyId, true, nullptr); wifiReplyId = -1; }
     return;
   }
+  if (wifiDrawer || wifiJoining) { wifiParked=false; wifiOkAt=now; return; }
   if (WiFi.status() == WL_CONNECTED) {
     wifiOkAt = now;
     wifiParked = false;      // an add from the Mac can bring the radio up mid-park
@@ -2852,6 +3010,13 @@ static void touchPoll() {
 #if TOUCH_MIRROR_Y
     y = LCD_H - 1 - y;
 #endif
+    int edgeX,edgeY;pageXY(x,y,edgeX,edgeY);
+    int startX,startY;pageXY(tpStartX,tpStartY,startX,startY);
+    if(wifiDrawer || (tpWasDown && startY<48 && !claimShowing() && !listening) || (!claimShowing() && !listening && edgeY<48 && !tpWasDown)) {
+      if(!tpWasDown){tpStartX=x;tpStartY=y;tpDownAt=millis();tpConsumed=false;}
+      tpLastX=x;tpLastY=y;tpWasDown=true;pendH=pendV=0;
+      return;
+    }
     if (!tpWasDown) {
       tpStartX = x; tpStartY = y;
       tpDownAt = millis();
@@ -2954,6 +3119,20 @@ static void touchPoll() {
     }
     bool vh = abs(vdx) > SWIPE_MIN_PX && abs(vdx) > 2 * abs(vdy);
     bool vv = abs(vdy) > VSWIPE_MIN_PX && 2 * abs(vdy) > 3 * abs(vdx);
+    int sx,sy,ex,ey;pageXY(tpStartX,tpStartY,sx,sy);pageXY(tpLastX,tpLastY,ex,ey);
+    if(!claimShowing() && !listening && (wifiDrawer || (sy<48 && ey-sy>60 && abs(ex-sx)*2<ey-sy))) {
+      pendH=pendV=0;tpConsumed=false;lastTapAt=0;
+      if(!wifiDrawer) {
+        wifiDrawer=true;wifiDrawerRot=shownRot;wifiEditing=false;wifiListOffset=0;
+        wifiNotice="";setCardUntil=profUntil=0;wifiStartScan();
+      } else if(abs(ey-sy)>50 && abs(ey-sy)>abs(ex-sx)*2) {
+        if(!wifiEditing) {
+          if(sy<100 && ey<sy) {wifiDrawer=false;if(!wifiJoining)wifiInput="";}
+          else wifiListOffset=max(0,wifiListOffset+(ey<sy?3:-3));
+        }
+      } else if(abs(ex-sx)<20 && abs(ey-sy)<20) wifiDrawerTap(ex,ey);
+      tpWasDown=false;noteActivity();return;
+    }
     if (claimShowing()) {
       // claim card owns the touch (modal). Only the green button says yes;
       // outside the card or a >=700 ms hold says no; swipes and the rest of
@@ -3461,6 +3640,7 @@ void loop() {
   imuPoll();
   touchPoll();
   wifiPoll();
+  wifiDrawerPoll();
   netPoll();
 
   // keepalive on EVERY link that is up — each host watchdog needs its own
@@ -3787,6 +3967,8 @@ void loop() {
       pg = viewPg;
       rotSec = held ? gravSector : orient;
     }
+    if(claimShowing() || sessEffState()==ST_NEEDS_YOU || listening)wifiDrawer=false;
+    if(wifiDrawer)rotSec=wifiDrawerRot;
     shownPage = pg;       // the touch layer keys gestures off what is really
     shownRot  = rotSec;   // on screen (and the rotation it was drawn in)
     if (viewLock && pg == PAGE_CLOCK) clockView = viewSub;   // so swipes resume from here
@@ -3795,6 +3977,10 @@ void loop() {
     int32_t pleft = (int32_t)(toastUntil - now);
     float pinK = pleft <= 0 ? 0.0f : (pleft < 400 ? pleft / 400.0f : 1.0f);
     const char* pinLabel = toastText;
+    if(wifiDrawer) {
+      canvas->setRotation((4-rotSec)&3);wifiDrawerDraw(canvas);
+      canvas->setRotation(0);canvas->flush();delay(2);return;
+    }
     if (pg != PAGE_FACE) {
       canvas->setRotation((4 - rotSec) & 3);
       uint8_t cv = viewLock ? viewSub : bound ? CV_CLOCK : clockView;
