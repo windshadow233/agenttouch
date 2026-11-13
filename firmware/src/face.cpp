@@ -7,6 +7,7 @@
 // dots, "?", sweat) are accents only.
 // Spec: design/EFaces.dc.html (states) + design/EWorkMotion.dc.html (timing).
 #include "face.h"
+#include "button_feedback.h"
 #include "grokface.h"   // 第六套皮肤 grok: polygon eyes + shared blink clock
 #include "pages.h"   // almanacPrint: shared AA CJK text (send bubble)
 #include "i18n.h"
@@ -179,6 +180,7 @@ static void drawSendBubble(Arduino_Canvas* c, const FaceFrame& f) {
   c->fillRect(ax, ay - 2, 19, 3, arr);
   c->fillTriangle(ax - 7, ay, ax + 2, ay - 7, ax + 2, ay + 7, arr);
   bubbleLabel(c, x + 72, y + 34, tr(S_SEND), dim565(EYE, k), panel);
+  buttonPressedOutline(c,x,y,w,h,25);
 }
 
 // needs_you decision bubble: while the selected agent waits on an approval,
@@ -194,6 +196,7 @@ static void drawApproveBubble(Arduino_Canvas* c, uint32_t t) {
   drawRotatedPill(c, ax - 4, ay + 2, 17, 6, 45, tick);
   drawRotatedPill(c, ax + 7, ay - 1, 26, 6, -45, tick);
   bubbleLabel(c, x + 72, y + 34, tr(S_APPROVE), EYE, PANEL);
+  buttonPressedOutline(c,x,y,w,h,25);
   const char* hint = tr(S_HOLD_REJECT);
   if (langEn())            // English hint: 18 px, centred
     almanacPrintSmall(c, 240 - almanacTextWidthSmall(hint) / 2, y + h + 28, hint,
@@ -247,6 +250,7 @@ static void drawProfile(Arduino_Canvas* c, const FaceFrame& f) {
   float k = f.profK;
   c->fillRoundRect(70, 300, 340, 162, 24, dim565(PANEL, 0.5f + 0.5f * k));
   c->drawRoundRect(70, 300, 340, 162, 24, dim565(GREYDIM, k));
+  buttonPressedOutline(c,70,300,340,162,24);
 
   c->setTextSize(1);
   c->setFont(u8g2_font_fur25_tr);
@@ -320,6 +324,7 @@ static void drawSettingsCard(Arduino_Canvas* c, const FaceFrame& f) {
       c->drawRoundRect(tx + 1, ty + 1, TILE_SZ - 2, TILE_SZ - 2, 9,
                        dim565(accent, k));
     }
+    buttonPressedOutline(c,tx,ty,TILE_SZ,TILE_SZ,10);
     int cx = tx + 25, cy = ty + 28;
     uint16_t body = dim565(EYE, (sel ? 1.0f : 0.62f) * k);
     if (i == SKIN_ROBO) {                        // boxy eyes + shine notch
@@ -361,6 +366,7 @@ static void drawSettingsCard(Arduino_Canvas* c, const FaceFrame& f) {
     bool sel = i == f.setBright;
     c->fillRoundRect(bx, 420 - h, 40, h, 6,
                      dim565(sel ? EYE : GREYDIM, (sel ? 1.0f : 0.6f) * k));
+    if(buttonPressedIn(bx-14,380,68,54))buttonOutline(c,bx-4,384,48,40,8);
   }
 
   // read-only status, two lines: link / IP / battery, then SD / firmware
@@ -396,6 +402,7 @@ static void drawClaimCard(Arduino_Canvas* c, const FaceFrame& f, uint32_t t) {
     c->drawRoundRect(120, 400, 240, 56, 28, dim565(GREEN, br * k));
     c->drawRoundRect(121, 401, 238, 54, 27, dim565(GREEN, br * k));
   }
+  if(!ok && buttonPressedIn(112,392,256,72))buttonOutline(c,120,400,240,56,28);
   const char* lab = tr(ok ? S_CLAIM_DONE : S_CLAIM_OK);
   int gw = 30 + 14 + almanacTextWidth(lab), gx = 240 - gw / 2;
   uint16_t tick = ok ? BG : dim565(GREEN, br * k);
@@ -441,6 +448,7 @@ static void drawPin(Arduino_Canvas* c, const FaceFrame& f) {
   c->fillCircle(cx, cy - 6, 7, col);                 // head
   c->fillRect(cx - 9, cy - 1, 18, 4, col);           // collar
   drawRotatedPill(c, cx, cy + 8, 12, 4, 90, col);    // needle, straight down
+  buttonPressedOutline(c,416,416,48,48,12);
 }
 
 // Volume overlay: phone-style vertical bar on the right edge — ten segments
@@ -901,6 +909,8 @@ static void drawSessRow(Arduino_Canvas* c, const FaceFrame& f, uint32_t t, float
   uint16_t dimC = dim565(SR_DIM, 0.9f * k), litC = dim565(EYE, k);
   srChevron(c, -1, f.sessLit < 0 ? litC : dimC);
   srChevron(c, +1, f.sessLit > 0 ? litC : dimC);
+  if(buttonPressedIn(0,0,240,110))buttonOutline(c,16,30,28,32,8);
+  if(buttonPressedIn(240,0,240,110))buttonOutline(c,436,30,28,32,8);
 }
 
 // ---- 未读完成 (canvas FwFzmu7JqSNhtKvKnWAdmA) ----

@@ -5,6 +5,7 @@
 // agent-accent details, one white rounded card with a flat analog dial.
 // Time comes from the host ({"t":"time"}); a soft clock runs on millis().
 #include "pages.h"
+#include "button_feedback.h"
 #include "config.h"
 #include "pet_fonts.h"
 #include "i18n.h"
@@ -938,6 +939,7 @@ bool radioPageTap(int px,int py){
 }
 static void radioButton(Arduino_Canvas* c,int x,int y,int w,const char* title){
  c->fillRoundRect(x,y,w,56,12,AL_INK);c->drawRoundRect(x,y,w,56,12,AL_INKBRD);
+ buttonPressedOutline(c,x,y,w,56,12);
  afPrint(c,AF_TINY,x+(w-afWidth(AF_TINY,title))/2,y+35,title,AL_WHITE,AL_INK);
 }
 static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
@@ -953,6 +955,7 @@ static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
   if(!radioEpisode(index,title,sizeof title,&duration))break;
   int y=76+row*80;c->fillRoundRect(16,y,448,70,12,AL_INK);
   c->drawRoundRect(16,y,448,70,12,index==selected?accent:AL_INKBRD);
+  buttonPressedOutline(c,16,y,448,70,12);
   pmText(4+row,AF_TINY,title,408,true);
   afPrint(c,AF_TINY,32,y+27,pmL1[4+row],AL_WHITE,AL_INK);
   if(pmLines[4+row]>1)afPrint(c,AF_TINY,32,y+52,pmL2[4+row],AL_WHITE,AL_INK);
@@ -1061,6 +1064,11 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
   c->fillCircle(240, GLYPH_CY, PLAY_R, AL_INK);
   c->drawCircle(240, GLYPH_CY, PLAY_R, AL_INKBRD);
   pmPlayPause(c, 240, GLYPH_CY, has && playing, gcol);
+  if(has){
+    if(buttonPressedIn(160,BAND_Y,160,BAND_H))buttonCircleOutline(c,240,GLYPH_CY,PLAY_R);
+    if(buttonPressedIn(0,BAND_Y,160,BAND_H))buttonOutline(c,44,GLYPH_CY-32,72,64,14);
+    if(buttonPressedIn(320,BAND_Y,160,BAND_H))buttonOutline(c,364,GLYPH_CY-32,72,64,14);
+  }
 
   if(!mac&&radioEnabled()&&volK<=0.02f){
     radioButton(c,24,408,210,langEn()?"Fetch":"获取节目");

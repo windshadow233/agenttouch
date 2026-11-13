@@ -23,6 +23,7 @@
 #include "config.h"
 #include "face.h"
 #include "pages.h"
+#include "button_feedback.h"
 #include "audio.h"
 #include "ble.h"
 #include "sdcard.h"
@@ -1564,6 +1565,8 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   wifiUiText(c,58,48,"Wi-Fi",fg);
   wifiUiText(c,300,48,wifiEditing?(langEn()?"Back":"返回"):(langEn()?"Scan":"扫描"),accent);
   wifiUiText(c,398,48,langEn()?"Close":"关闭",muted);
+  if(!wifiJoining)buttonPressedOutline(c,290,20,92,40,10);
+  buttonPressedOutline(c,390,20,78,40,10);
   String status=wifiNotice;
   if(wifiJoining) status=langEn()?"Connecting...":"正在连接…";
   else if(wifiScanning) status=langEn()?"Scanning...":"正在扫描…";
@@ -1588,6 +1591,7 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
       String ssid=row.ssid;
       c->drawRoundRect(48,y,384,68,12,0x3186);
       bool canForget=wifiKnown(ssid)>=0;
+      if(!canForget||!buttonPressedIn(320,y+12,100,44))buttonPressedOutline(c,48,y,384,68,12);
       almanacFit(fitted,sizeof(fitted),ssid.c_str(),canForget?240:344,true);
       wifiUiText(c,66,y+27,fitted,fg);
       bool connected=WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid;
@@ -1600,6 +1604,7 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
       wifiUiText(c,66,y+53,fitted,connected?accent:muted);
       if(canForget) {
         c->drawRoundRect(320,y+12,100,44,10,0xB30C);
+        buttonPressedOutline(c,320,y+12,100,44,10);
         const char* forgetLabel=langEn()?"Forget":"忘记";
         wifiUiText(c,370-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
       }
@@ -1616,20 +1621,24 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   c->drawRoundRect(48,125,384,44,10,0x3186);
   wifiUiText(c,60,153,password.length()?password.c_str():(langEn()?"Password (empty for open)":"密码（开放网络留空）"),fg);
   wifiUiText(c,372,153,wifiShowPass?"Hide":"Show",accent);
+  if(!wifiJoining)buttonPressedOutline(c,364,128,64,38,8);
   for(int r=0;r<4;r++) {
     const char* keys=wifiKeyRows[wifiKeyMode][r];int count=strlen(keys);
     for(int k=0;k<count;k++) {
       int x=40+k*40,y=182+r*48;
       c->fillRoundRect(x,y,37,43,6,0x2104);
+      if(!wifiJoining)buttonPressedOutline(c,x,y,37,43,6);
       char key[2]={keys[k],0};wifiUiText(c,x+11,y+29,key,fg);
     }
   }
   const char* buttons[]={wifiKeyMode==1?"abc":"ABC","#+=","Space","Del"};
   for(int i=0;i<4;i++) {
     c->fillRoundRect(40+i*100,378,96,38,7,0x2104);
+    if(!wifiJoining)buttonPressedOutline(c,40+i*100,378,96,38,7);
     wifiUiText(c,50+i*100,404,buttons[i],fg);
   }
   c->fillRoundRect(100,424,280,38,12,0x236B);
+  if(!wifiJoining)buttonPressedOutline(c,100,424,280,38,12);
   const char* connectLabel=langEn()?"Connect":"连接";
   wifiUiText(c,240-almanacTextWidthSmall(connectLabel)/2,450,connectLabel,fg);
 }
@@ -4119,6 +4128,10 @@ void loop() {
     int32_t pleft = (int32_t)(toastUntil - now);
     float pinK = pleft <= 0 ? 0.0f : (pleft < 400 ? pleft / 400.0f : 1.0f);
     const char* pinLabel = toastText;
+    int pressStartX,pressStartY,pressX,pressY;
+    pageXY(tpStartX,tpStartY,pressStartX,pressStartY);
+    pageXY(tpLastX,tpLastY,pressX,pressY);
+    buttonFeedbackSet(tpWasDown&&!tpConsumed,pressStartX,pressStartY,pressX,pressY);
     if(wifiDrawer) {
       canvas->setRotation((4-rotSec)&3);wifiDrawerDraw(canvas);
       canvas->setRotation(0);canvas->flush();delay(2);return;
