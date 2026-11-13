@@ -1500,22 +1500,32 @@ static int wifiKnown(const String& ssid) {
   for (int i=0;i<wifiN;i++) if (wifiSsid[i]==ssid) return i;
   return kFactoryWifi && ssid==WIFI_SSID ? WIFI_FACTORY : -1;
 }
-static int wifiRows(std::vector<String>& rows) {
-  rows.clear();
-  if(wifiScanning)return 0;
-  // Preserve connected/saved priority, but only for SSIDs heard in this scan.
-  auto addVisible=[&](const String& sid) {
-    bool seen=false;
-    for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==sid)seen=true;
-    if(!seen)return;
-    for(const String& row:rows)if(row==sid)return;
-    rows.push_back(sid);
+enum WifiRowKind : uint8_t { WIFI_ROW_NET, WIFI_ROW_MINE, WIFI_ROW_OTHER, WIFI_ROW_EMPTY, WIFI_ROW_SCAN };
+struct WifiListRow { String ssid; WifiRowKind kind; };
+static int wifiRowHeight(const WifiListRow& row) {
+  return row.kind==WIFI_ROW_NET?75:(row.kind==WIFI_ROW_MINE || row.kind==WIFI_ROW_OTHER)?28:40;
+}
+static int wifiRows(std::vector<WifiListRow>& rows) {
+  rows.clear();rows.push_back({"",WIFI_ROW_MINE});
+  auto addNetwork=[&](const String& sid) {
+    for(const auto& row:rows)if(row.kind==WIFI_ROW_NET && row.ssid==sid)return;
+    rows.push_back({sid,WIFI_ROW_NET});
   };
-  if(WiFi.status()==WL_CONNECTED)addVisible(WiFi.SSID());
-  for(const String& sid:wifiSsid)addVisible(sid);
-  if(kFactoryWifi)addVisible(WIFI_SSID);
-  for(int i=0;i<wifiNearN;i++)addVisible(wifiNear[i]);
+  if(WiFi.status()==WL_CONNECTED)addNetwork(WiFi.SSID());
+  for(const String& sid:wifiSsid)addNetwork(sid);
+  if(kFactoryWifi)addNetwork(WIFI_SSID);
+  if(rows.size()==1)rows.push_back({"",WIFI_ROW_EMPTY});
+  rows.push_back({"",WIFI_ROW_OTHER});
+  size_t others=rows.size();
+  if(!wifiScanning)for(int i=0;i<wifiNearN;i++)addNetwork(wifiNear[i]);
+  if(rows.size()==others)rows.push_back({"",wifiScanning?WIFI_ROW_SCAN:WIFI_ROW_EMPTY});
   return rows.size();
+}
+static void wifiClampList(const std::vector<WifiListRow>& rows) {
+  // Clamp to the first row of the last viewport after scan/forget changes.
+  int top=(int)rows.size(),height=0;
+  while(top>0 && height+wifiRowHeight(rows[top-1])<=300)height+=wifiRowHeight(rows[--top]);
+  wifiListOffset=max(0,min(wifiListOffset,top));
 }
 static void wifiDrawerJoin() {
   if(wifiScanning) { wifiNotice=langEn()?"Wait for scan":"请等待扫描完成"; return; }
@@ -1561,10 +1571,21 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   char fitted[128];almanacFit(fitted,sizeof(fitted),status.c_str(),364,true);
   wifiUiText(c,58,79,fitted,muted);
   if(!wifiEditing) {
-    std::vector<String> rows;int n=wifiRows(rows);
-    if(wifiListOffset>max(0,n-4))wifiListOffset=max(0,n-4);
-    for(int r=0;r<4 && r+wifiListOffset<n;r++) {
-      String ssid=rows[r+wifiListOffset];int y=100+r*75;
+    std::vector<WifiListRow> rows;int n=wifiRows(rows);
+    wifiClampList(rows);
+    int y=100;
+    for(int r=wifiListOffset;r<n;r++) {
+      const auto& row=rows[r];int height=wifiRowHeight(row);
+      if(y+height>400)break;
+      if(row.kind!=WIFI_ROW_NET) {
+        const char* label=row.kind==WIFI_ROW_MINE?(langEn()?"My Networks":"我的网络"):
+          row.kind==WIFI_ROW_OTHER?(langEn()?"Other Networks":"其他网络"):
+          row.kind==WIFI_ROW_SCAN?(langEn()?"Scanning...":"正在扫描…"):
+          (langEn()?"None":"暂无网络");
+        wifiUiText(c,58,y+20,label,row.kind==WIFI_ROW_MINE || row.kind==WIFI_ROW_OTHER?accent:muted);
+        y+=height;continue;
+      }
+      String ssid=row.ssid;
       c->drawRoundRect(48,y,384,68,12,0x3186);
       bool canForget=wifiKnown(ssid)>=0;
       almanacFit(fitted,sizeof(fitted),ssid.c_str(),canForget?240:344,true);
@@ -1572,6 +1593,8 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
       bool connected=WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid;
       const char* label=connected?(langEn()?"Connected":"已连接"):wifiKnown(ssid)!=-1?(langEn()?"Saved":"已记住"):(langEn()?"Nearby":"附近网络");
       int rssi=0;for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==ssid)rssi=wifiNearRssi[i];
+      if(!connected && wifiKnown(ssid)!=-1 && !rssi && !wifiScanning)
+        label=langEn()?"Out of range":"不在范围内";
       String detail=label;if(rssi)detail+="  "+String(rssi)+" dBm";
       almanacFit(fitted,sizeof(fitted),detail.c_str(),canForget?240:344,true);
       wifiUiText(c,66,y+53,fitted,connected?accent:muted);
@@ -1580,8 +1603,8 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
         const char* forgetLabel=langEn()?"Forget":"忘记";
         wifiUiText(c,370-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
       }
+      y+=height;
     }
-    if(!n && !wifiScanning)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
     const char* footer=langEn()?"Swipe up from bottom to close":"滑动浏览 · 底部上滑关闭";
     wifiUiText(c,240-almanacTextWidthSmall(footer)/2,435,footer,muted);
     return;
@@ -1622,16 +1645,22 @@ static void wifiDrawerTap(int x,int y) {
   if(wifiJoining)return;
   if(!wifiEditing) {
     if(x<48||x>=432||y<100||y>=400)return;
-    int r=(y-100)/75;if((y-100)%75>=68)return;
-    std::vector<String> rows;int n=wifiRows(rows);r+=wifiListOffset;
-    if(r>=n)return;
-    if(x>=320 && x<420 && (y-100)%75>=12 && (y-100)%75<56 && wifiKnown(rows[r])>=0) {
-      String sid=rows[r];const char* error=wifiForget(sid);
+    std::vector<WifiListRow> rows;int n=wifiRows(rows);
+    wifiClampList(rows);int top=100,r=wifiListOffset;
+    for(;r<n;r++) {
+      int height=wifiRowHeight(rows[r]);
+      if(top+height>400)return;
+      if(y<top+height)break;
+      top+=height;
+    }
+    if(r>=n || rows[r].kind!=WIFI_ROW_NET || y-top>=68)return;
+    if(x>=320 && x<420 && y-top>=12 && y-top<56 && wifiKnown(rows[r].ssid)>=0) {
+      String sid=rows[r].ssid;const char* error=wifiForget(sid);
       wifiNotice=error?(langEn()?"Could not forget; please retry":"忘记失败，请重试"):
         (langEn()?"Network forgotten":"已忘记网络");
       return;
     }
-    wifiTarget=rows[r];int known=wifiKnown(wifiTarget);
+    wifiTarget=rows[r].ssid;int known=wifiKnown(wifiTarget);
     wifiInput=known==WIFI_FACTORY?String(WIFI_PASS):known>=0?wifiPass[known]:String();
     wifiEditing=true;wifiShowPass=false;wifiKeyMode=0;wifiNotice="";
     if(known!=-1)wifiDrawerJoin();
@@ -3219,7 +3248,7 @@ static void touchPoll() {
       } else if(abs(ey-sy)>50 && abs(ey-sy)>abs(ex-sx)*2) {
         if(sy>=400 && ey<sy) {wifiDrawer=false;if(!wifiJoining)wifiInput="";}
         else if(!wifiEditing && sy>=100 && sy<400)
-          wifiListOffset=max(0,wifiListOffset+(ey<sy?3:-3));
+          wifiListOffset=max(0,wifiListOffset+(ey<sy?2:-2));
       } else if(abs(ex-sx)<20 && abs(ey-sy)<20) wifiDrawerTap(ex,ey);
       tpWasDown=false;noteActivity();return;
     }
