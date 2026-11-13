@@ -1473,7 +1473,7 @@ static void wifiUiText(Arduino_Canvas* c,int x,int y,const char* text,uint16_t c
 static void wifiDrawerDraw(Arduino_Canvas* c) {
   const uint16_t bg=0x0841,fg=0xFFFF,muted=0x9CF3,accent=0x5EBD;
   c->fillScreen(bg);
-  c->fillRoundRect(210,12,60,5,2,muted);
+  c->fillRoundRect(210,468,60,5,2,muted);
   wifiUiText(c,58,48,"Wi-Fi",fg);
   wifiUiText(c,300,48,wifiEditing?(langEn()?"Back":"返回"):(langEn()?"Scan":"扫描"),accent);
   wifiUiText(c,398,48,langEn()?"Close":"关闭",muted);
@@ -1498,7 +1498,8 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
       wifiUiText(c,66,y+53,detail.c_str(),connected?accent:muted);
     }
     if(!n)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
-    wifiUiText(c,100,435,langEn()?"Swipe to browse / up at top to close":"滑动浏览 · 顶部上滑关闭",muted);
+    const char* footer=langEn()?"Swipe up from bottom to close":"滑动浏览 · 底部上滑关闭";
+    wifiUiText(c,240-almanacTextWidthSmall(footer)/2,435,footer,muted);
     return;
   }
   almanacFit(fitted,sizeof(fitted),wifiTarget.c_str(),364,true);wifiUiText(c,58,111,fitted,fg);
@@ -3126,10 +3127,9 @@ static void touchPoll() {
         wifiDrawer=true;wifiDrawerRot=shownRot;wifiEditing=false;wifiListOffset=0;
         wifiNotice="";setCardUntil=profUntil=0;wifiStartScan();
       } else if(abs(ey-sy)>50 && abs(ey-sy)>abs(ex-sx)*2) {
-        if(!wifiEditing) {
-          if(sy<100 && ey<sy) {wifiDrawer=false;if(!wifiJoining)wifiInput="";}
-          else wifiListOffset=max(0,wifiListOffset+(ey<sy?3:-3));
-        }
+        if(sy>=400 && ey<sy) {wifiDrawer=false;if(!wifiJoining)wifiInput="";}
+        else if(!wifiEditing && sy>=100 && sy<400)
+          wifiListOffset=max(0,wifiListOffset+(ey<sy?3:-3));
       } else if(abs(ex-sx)<20 && abs(ey-sy)<20) wifiDrawerTap(ex,ey);
       tpWasDown=false;noteActivity();return;
     }
