@@ -48,7 +48,7 @@ On the Mac the host raises apps with `open -a`, presses keys with Quartz events 
 - The Mac opens two ports. **8788** is bound to 127.0.0.1: hooks, the settings page, `/state`, `/ota` and the `/test/*` debug endpoints. It is needed whether or not a board is around. **8737** listens on the LAN for the board. The board opens no ports.
 - The board sends events over BLE when it is up, else over TCP, and a `ping` every 10 s on each link; a link that goes quiet is dropped. BLE alone is enough for states, approvals and dictation; files, firmware, speech and screenshots need TCP.
 - The board finds the owner Mac over TCP by its mDNS name, else by the last IP the host told it.
-- Wi-Fi networks come from the settings page over BLE. The board keeps up to 4 in NVS and joins the strongest one in range. After 3 minutes without a known network it turns the radio off and probes now and then; BLE keeps working.
+- Wi-Fi networks come from the settings page over BLE. The board stores a dynamic list without a fixed count limit (SD card first, onboard storage as fallback) and joins the strongest one in range. After 3 minutes without a known network it turns the radio off and probes now and then; BLE keeps working.
 - Before the Mac sleeps the host drops both links, and takes them back once the display is on, so the board's heartbeat cannot keep waking the Mac.
 
 ### One owner Mac

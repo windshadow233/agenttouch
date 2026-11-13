@@ -73,7 +73,7 @@ After the flash the board restarts and advertises over Bluetooth. When the host 
 
 ## 4. Wi-Fi for the board
 
-Open <http://127.0.0.1:8788/settings> → **Board**. Pick a network the board found and type its password. The board remembers up to 4 and joins the strongest.
+Open <http://127.0.0.1:8788/settings> → **Board**. Pick a network the board found and type its password. The board remembers networks without a fixed count limit (SD card first, onboard storage as fallback) and joins the strongest.
 
 - Bluetooth alone covers status, approve and dictation. Wi-Fi adds the card fonts, almanac, podcasts, speech and cable-free updates.
 - The password goes to the board over Bluetooth, unencrypted, once, when you add the network. Do it at home if that matters to you.

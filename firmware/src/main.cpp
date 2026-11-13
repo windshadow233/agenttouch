@@ -18,6 +18,7 @@
 #include <lwip/sockets.h>
 #include <errno.h>
 #include <new>
+#include <vector>
 #include "pins.h"
 #include "config.h"
 #include "face.h"
@@ -1281,17 +1282,18 @@ static uint32_t pmuIrqPolls = 0;      // debug: how many times we polled
 static bool btnPwrDown();
 // ---------- known Wi-Fi networks ----------
 // The Mac's settings page adds networks over BLE ({"t":"wifi","op":"add"});
-// they live in NVS "wifinet" (s0..s3 / p0..p3, newest first). config.h's
+// they live in NVS "wifinet" (SD-first dynamic JSON list, newest first). config.h's
 // WIFI_SSID is the factory entry, always known, never stored, never removed
 // (only when config.local.h sets one: kFactoryWifi; the public build has none).
 // Connecting = scan, then join the strongest known network in range, so a
 // board carried to another place picks that place's network by itself.
 // Passwords never leave the board: replies carry SSIDs and signal only.
-static const int WIFI_NETS_MAX = 4;
+static const int WIFI_FACTORY = -2;
 static Preferences wifiPrefs;
-static String   wifiSsid[WIFI_NETS_MAX], wifiPass[WIFI_NETS_MAX];
+static std::vector<String> wifiSsid, wifiPass;
 static int      wifiN = 0;
-static int16_t  wifiSeen[WIFI_NETS_MAX + 1];   // last scan's RSSI per net (last slot = factory), 0 = not seen
+static std::vector<int16_t> wifiSeen;
+static int16_t wifiFactorySeen = 0;
 static bool     wifiScanning = false;
 static uint32_t wifiScanAt = 0;                // when the last scan started
 static int      wifiReplyId = -1;              // a list reply owed once the scan lands (-1 = none)
@@ -1310,29 +1312,106 @@ static int wifiListOffset = 0;
 static String wifiTarget, wifiInput, wifiNotice;
 static uint32_t wifiJoinAt = 0;
 
-static void wifiLoad() {
-  wifiPrefs.begin("wifinet", false);
-  wifiN = 0;
-  for (int i = 0; i < WIFI_NETS_MAX; i++) {
-    char k[4];
-    snprintf(k, sizeof k, "s%d", i);
-    String sid = wifiPrefs.getString(k, "");
-    if (!sid.length()) continue;
-    snprintf(k, sizeof k, "p%d", i);
-    wifiSsid[wifiN] = sid;
-    wifiPass[wifiN] = wifiPrefs.getString(k, "");
-    wifiN++;
+static const char* WIFI_CARD_PATH="/agentpet/wifi.json";
+static const char* WIFI_CARD_TEMP="/agentpet/wifi.tmp";
+static const char* WIFI_CARD_BACKUP="/agentpet/wifi.bak";
+static uint32_t wifiRevision=0;
+static bool wifiOnCard=false;
+
+static bool wifiCardRead(const char* path,JsonDocument& d) {
+  fs::FS* fs=sdFs();if(!fs)return false;
+  File file=fs->open(path,FILE_READ);if(!file)return false;
+  bool ok=!deserializeJson(d,file) && d["nets"].is<JsonArray>();
+  file.close();return ok;
+}
+static bool wifiCardWrite(const String& encoded) {
+  fs::FS* fs=sdFs();if(!fs || !sdMkdirs(WIFI_CARD_PATH))return false;
+  File file=fs->open(WIFI_CARD_TEMP,FILE_WRITE);if(!file)return false;
+  bool ok=file.print(encoded)==encoded.length();file.flush();file.close();
+  JsonDocument check;
+  if(!ok || !wifiCardRead(WIFI_CARD_TEMP,check))return false;
+  // Keep the last committed file recoverable if power fails during rename.
+  if(fs->exists(WIFI_CARD_PATH)) {
+    if(fs->exists(WIFI_CARD_BACKUP) && !fs->remove(WIFI_CARD_BACKUP))return false;
+    if(!fs->rename(WIFI_CARD_PATH,WIFI_CARD_BACKUP))return false;
   }
+  if(!fs->rename(WIFI_CARD_TEMP,WIFI_CARD_PATH)) {
+    if(fs->exists(WIFI_CARD_BACKUP))fs->rename(WIFI_CARD_BACKUP,WIFI_CARD_PATH);
+    return false;
+  }
+  return true;
+}
+static bool wifiStore(const std::vector<String>& ssids,
+                      const std::vector<String>& passwords);
+
+static void wifiLoad() {
+  static bool prefsOpen=false;
+  if(!prefsOpen)prefsOpen=wifiPrefs.begin("wifinet", false);
+  wifiSsid.clear(); wifiPass.clear();
+  JsonDocument nvs,card;
+  bool nvsOk=!deserializeJson(nvs,wifiPrefs.getString("networks","null")) &&
+    (nvs.is<JsonArray>() || nvs["nets"].is<JsonArray>());
+  bool cardOk=wifiCardRead(WIFI_CARD_PATH,card);
+  if(!cardOk)cardOk=wifiCardRead(WIFI_CARD_BACKUP,card);
+  uint32_t nr=nvs["rev"] | 0U, cr=card["rev"] | 0U;
+  wifiRevision=wifiPrefs.getUInt("revision",0);
+  wifiRevision=max(wifiRevision,max(nr,cr));
+  wifiOnCard=cardOk && (!nvsOk || cr>=nr);
+  if(cardOk || nvsOk) {
+    JsonDocument& d=wifiOnCard?card:nvs;
+    JsonArray nets=d.is<JsonArray>()?d.as<JsonArray>():d["nets"].as<JsonArray>();
+    for(JsonObject net:nets) {
+      String sid=net["s"] | "",pw=net["p"] | "";
+      if(!sid.length() || sid.length()>32 ||
+          (pw.length() && (pw.length()<8 || pw.length()>63)))continue;
+      wifiSsid.push_back(sid);wifiPass.push_back(pw);
+    }
+  } else {
+    // Read legacy slots on upgrade; the next successful save migrates them.
+    for (int i=0; i<4; i++) {
+      char key[4]; snprintf(key,sizeof(key),"s%d",i);
+      String sid=wifiPrefs.getString(key,"");
+      if (!sid.length()) continue;
+      snprintf(key,sizeof(key),"p%d",i);
+      wifiSsid.push_back(sid); wifiPass.push_back(wifiPrefs.getString(key,""));
+    }
+  }
+  wifiN=wifiSsid.size(); wifiSeen.assign(wifiN,0);
+  if(!wifiOnCard && sdFs() && (nvsOk || wifiN))wifiStore(wifiSsid,wifiPass);
 }
 
-static void wifiSave() {
-  for (int i = 0; i < WIFI_NETS_MAX; i++) {
-    char ks[4], kp[4];
-    snprintf(ks, sizeof ks, "s%d", i);
-    snprintf(kp, sizeof kp, "p%d", i);
-    if (i < wifiN) { wifiPrefs.putString(ks, wifiSsid[i]); wifiPrefs.putString(kp, wifiPass[i]); }
-    else if (wifiPrefs.isKey(ks)) { wifiPrefs.remove(ks); wifiPrefs.remove(kp); }
+static bool wifiStore(const std::vector<String>& ssids,
+                      const std::vector<String>& passwords) {
+  // Reserve a revision even for SD writes, so a later card-less save wins
+  // over an older card when it is reinserted.
+  uint32_t revision=wifiRevision+1;
+  if(wifiPrefs.putUInt("revision",revision)!=sizeof(uint32_t))return false;
+  wifiRevision=revision;
+  JsonDocument d;d["rev"]=revision;JsonArray nets=d["nets"].to<JsonArray>();
+  for (size_t i=0;i<ssids.size();i++) {
+    JsonObject net=nets.add<JsonObject>();net["s"]=ssids[i];net["p"]=passwords[i];
   }
+  String encoded;
+  if(d.overflowed() || !serializeJson(d,encoded))return false;
+  bool onCard=wifiCardWrite(encoded);
+  // No card or a failed card write: use a single committed NVS value.
+  if(!onCard && wifiPrefs.putString("networks",encoded)!=encoded.length())return false;
+  wifiOnCard=onCard;
+  if(onCard && wifiPrefs.isKey("networks"))wifiPrefs.remove("networks");
+  wifiSsid=ssids;wifiPass=passwords;wifiN=wifiSsid.size();wifiSeen.assign(wifiN,0);
+  for(int i=0;i<4;i++) {
+    char key[4];snprintf(key,sizeof(key),"s%d",i);wifiPrefs.remove(key);
+    snprintf(key,sizeof(key),"p%d",i);wifiPrefs.remove(key);
+  }
+  return true;
+}
+
+static bool wifiRemember(const String& sid,const String& password) {
+  std::vector<String> ssids{sid},passwords{password};
+  for(int i=0;i<wifiN;i++)if(wifiSsid[i]!=sid) {
+    ssids.push_back(wifiSsid[i]);passwords.push_back(wifiPass[i]);
+  }
+  return wifiStore(ssids,passwords);
 }
 
 // Kick off an async scan; wifiPoll() finishes it. Harmless while one runs.
@@ -1354,7 +1433,7 @@ static void wifiReply(int id, bool ok, const char* why) {
     JsonObject o = a.add<JsonObject>();
     o["s"] = fac ? WIFI_SSID : wifiSsid[i].c_str();
     if (fac) o["fac"] = 1;
-    o["seen"] = wifiSeen[fac ? WIFI_NETS_MAX : i];
+    o["seen"] = (fac ? wifiFactorySeen : wifiSeen[i]);
   }
   bool up = WiFi.status() == WL_CONNECTED;
   if (up) { r["cur"] = WiFi.SSID(); r["rssi"] = WiFi.RSSI(); r["ip"] = WiFi.localIP().toString(); }
@@ -1367,6 +1446,24 @@ static void wifiReply(int id, bool ok, const char* why) {
   sendJson(r);
 }
 
+// Shared by the on-board drawer and the Mac settings page.
+static const char* wifiForget(const String& sid) {
+  if(kFactoryWifi && sid==WIFI_SSID)return "factory";
+  int at=-1;
+  for(int i=0;i<wifiN;i++)if(wifiSsid[i]==sid)at=i;
+  if(at<0)return "unknown";
+  auto ssids=wifiSsid,passwords=wifiPass;
+  ssids.erase(ssids.begin()+at);passwords.erase(passwords.begin()+at);
+  if(!wifiStore(ssids,passwords))return "storage";
+  bool cancelJoin=wifiJoining && wifiTarget==sid;
+  if(cancelJoin) {wifiJoining=false;wifiEditing=false;wifiInput="";}
+  if(cancelJoin || (WiFi.status()==WL_CONNECTED && WiFi.SSID()==sid)) {
+    WiFi.disconnect(false,true); // clear the driver's pending reconnect credentials
+    wifiStartScan();
+  }
+  return nullptr;
+}
+
 static void wifiHandle(JsonDocument& d) {
   const char* op = d["op"] | "list";
   int id = d["id"] | 0;
@@ -1376,15 +1473,7 @@ static void wifiHandle(JsonDocument& d) {
     if (!sid.length() || sid.length() > 32) { wifiReply(id, false, "ssid"); return; }
     if (pw.length() && (pw.length() < 8 || pw.length() > 63)) { wifiReply(id, false, "pass"); return; }
     if (kFactoryWifi && sid == WIFI_SSID) { wifiReply(id, false, "factory"); return; }
-    // newest first: drop any old copy, shift down, the oldest falls off the end
-    int keep = 0;
-    String ns[WIFI_NETS_MAX], np[WIFI_NETS_MAX];
-    ns[keep] = sid; np[keep] = pw; keep++;
-    for (int i = 0; i < wifiN && keep < WIFI_NETS_MAX; i++)
-      if (wifiSsid[i] != sid) { ns[keep] = wifiSsid[i]; np[keep] = wifiPass[i]; keep++; }
-    for (int i = 0; i < WIFI_NETS_MAX; i++) { wifiSsid[i] = ns[i]; wifiPass[i] = np[i]; wifiSeen[i] = 0; }
-    wifiN = keep;
-    wifiSave();
+    if (!wifiRemember(sid,pw)) { wifiReply(id,false,"storage"); return; }
     Serial.printf("wifi: saved \"%s\" (%d known)\n", sid.c_str(), wifiN + (kFactoryWifi ? 1 : 0));
     // not online (or asked to switch): go find it now instead of at the next probe
     if (WiFi.status() != WL_CONNECTED || (d["join"] | 0)) {
@@ -1393,13 +1482,8 @@ static void wifiHandle(JsonDocument& d) {
     }
     wifiReply(id, true, nullptr);
   } else if (strcmp(op, "rm") == 0) {
-    int at = -1;
-    for (int i = 0; i < wifiN; i++) if (wifiSsid[i] == sid) at = i;
-    if (at < 0) { wifiReply(id, false, kFactoryWifi && sid == WIFI_SSID ? "factory" : "unknown"); return; }
-    for (int i = at; i < wifiN - 1; i++) { wifiSsid[i] = wifiSsid[i + 1]; wifiPass[i] = wifiPass[i + 1]; wifiSeen[i] = wifiSeen[i + 1]; }
-    wifiN--;
-    wifiSsid[wifiN] = ""; wifiPass[wifiN] = ""; wifiSeen[wifiN] = 0;
-    wifiSave();
+    const char* error=wifiForget(sid);
+    if(error) {wifiReply(id,false,error);return;}
     Serial.printf("wifi: forgot \"%s\"\n", sid.c_str());
     wifiReply(id, true, nullptr);
   } else if (strcmp(op, "scan") == 0) {   // fresh "seen" column for the page; answers when done
@@ -1413,22 +1497,22 @@ static void wifiHandle(JsonDocument& d) {
 // Wi-Fi drawer: a merged saved/nearby list and an ASCII password keyboard.
 static int wifiKnown(const String& ssid) {
   for (int i=0;i<wifiN;i++) if (wifiSsid[i]==ssid) return i;
-  return kFactoryWifi && ssid==WIFI_SSID ? WIFI_NETS_MAX : -1;
+  return kFactoryWifi && ssid==WIFI_SSID ? WIFI_FACTORY : -1;
 }
-static int wifiRows(String* rows) {
-  int n=0;
-  if (WiFi.status()==WL_CONNECTED) rows[n++]=WiFi.SSID();
+static int wifiRows(std::vector<String>& rows) {
+  rows.clear();int n=0;
+  if (WiFi.status()==WL_CONNECTED) {rows.push_back(WiFi.SSID());n++;}
   for (int i=0;i<wifiN;i++) {
     bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiSsid[i]) found=true;
-    if(!found) rows[n++]=wifiSsid[i];
+    if(!found) {rows.push_back(wifiSsid[i]);n++;}
   }
   if(kFactoryWifi) {
     bool found=false; for(int j=0;j<n;j++) if(rows[j]==WIFI_SSID) found=true;
-    if(!found) rows[n++]=WIFI_SSID;
+    if(!found) {rows.push_back(WIFI_SSID);n++;}
   }
   for(int i=0;i<wifiNearN;i++) {
     bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiNear[i]) found=true;
-    if(!found) rows[n++]=wifiNear[i];
+    if(!found) {rows.push_back(wifiNear[i]);n++;}
   }
   return n;
 }
@@ -1445,18 +1529,10 @@ static void wifiDrawerJoin() {
 static void wifiDrawerPoll() {
   if(!wifiJoining) return;
   if(WiFi.status()==WL_CONNECTED && WiFi.SSID()==wifiTarget) {
-    // Commit only credentials that actually connected; preserve factory entry.
-    if(wifiKnown(wifiTarget)!=WIFI_NETS_MAX) {
-      String ns[WIFI_NETS_MAX],np[WIFI_NETS_MAX];
-      ns[0]=wifiTarget; np[0]=wifiInput; int n=1;
-      for(int i=0;i<wifiN && n<WIFI_NETS_MAX;i++)
-        if(wifiSsid[i]!=wifiTarget) {ns[n]=wifiSsid[i];np[n++]=wifiPass[i];}
-      wifiN=n;
-      for(int i=0;i<WIFI_NETS_MAX;i++) {wifiSsid[i]=ns[i];wifiPass[i]=np[i];wifiSeen[i]=0;}
-      wifiSave();
-    }
+    bool saved=wifiKnown(wifiTarget)==WIFI_FACTORY || wifiRemember(wifiTarget,wifiInput);
     wifiJoining=false;wifiEditing=false;wifiInput="";
-    wifiNotice=langEn()?"Connected":"已连接";
+    wifiNotice=saved?(langEn()?"Connected":"已连接"):
+      (langEn()?"Connected; could not save":"已连接，存储写入失败，未保存");
   } else if((int32_t)(millis()-wifiJoinAt)>20000) {
     wifiJoining=false;WiFi.disconnect(false);
     wifiNotice=langEn()?"Failed. Check password and retry":"连接失败，请检查密码后重试";
@@ -1484,18 +1560,25 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   char fitted[128];almanacFit(fitted,sizeof(fitted),status.c_str(),364,true);
   wifiUiText(c,58,79,fitted,muted);
   if(!wifiEditing) {
-    String rows[WIFI_NETS_MAX+WIFI_NEAR_MAX+2];int n=wifiRows(rows);
+    std::vector<String> rows;int n=wifiRows(rows);
     if(wifiListOffset>max(0,n-4))wifiListOffset=max(0,n-4);
     for(int r=0;r<4 && r+wifiListOffset<n;r++) {
       String ssid=rows[r+wifiListOffset];int y=100+r*75;
       c->drawRoundRect(48,y,384,68,12,0x3186);
-      almanacFit(fitted,sizeof(fitted),ssid.c_str(),344,true);
+      bool canForget=wifiKnown(ssid)>=0;
+      almanacFit(fitted,sizeof(fitted),ssid.c_str(),canForget?240:344,true);
       wifiUiText(c,66,y+27,fitted,fg);
       bool connected=WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid;
-      const char* label=connected?(langEn()?"Connected":"已连接"):wifiKnown(ssid)>=0?(langEn()?"Saved":"已记住"):(langEn()?"Nearby":"附近网络");
+      const char* label=connected?(langEn()?"Connected":"已连接"):wifiKnown(ssid)!=-1?(langEn()?"Saved":"已记住"):(langEn()?"Nearby":"附近网络");
       int rssi=0;for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==ssid)rssi=wifiNearRssi[i];
       String detail=label;if(rssi)detail+="  "+String(rssi)+" dBm";
-      wifiUiText(c,66,y+53,detail.c_str(),connected?accent:muted);
+      almanacFit(fitted,sizeof(fitted),detail.c_str(),canForget?240:344,true);
+      wifiUiText(c,66,y+53,fitted,connected?accent:muted);
+      if(canForget) {
+        c->drawRoundRect(320,y+12,100,44,10,0xB30C);
+        const char* forgetLabel=langEn()?"Forget":"忘记";
+        wifiUiText(c,370-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
+      }
     }
     if(!n)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
     const char* footer=langEn()?"Swipe up from bottom to close":"滑动浏览 · 底部上滑关闭";
@@ -1539,12 +1622,18 @@ static void wifiDrawerTap(int x,int y) {
   if(!wifiEditing) {
     if(x<48||x>=432||y<100||y>=400)return;
     int r=(y-100)/75;if((y-100)%75>=68)return;
-    String rows[WIFI_NETS_MAX+WIFI_NEAR_MAX+2];int n=wifiRows(rows);r+=wifiListOffset;
+    std::vector<String> rows;int n=wifiRows(rows);r+=wifiListOffset;
     if(r>=n)return;
+    if(x>=320 && x<420 && (y-100)%75>=12 && (y-100)%75<56 && wifiKnown(rows[r])>=0) {
+      String sid=rows[r];const char* error=wifiForget(sid);
+      wifiNotice=error?(langEn()?"Could not forget; please retry":"忘记失败，请重试"):
+        (langEn()?"Network forgotten":"已忘记网络");
+      return;
+    }
     wifiTarget=rows[r];int known=wifiKnown(wifiTarget);
-    wifiInput=known==WIFI_NETS_MAX?String(WIFI_PASS):known>=0?wifiPass[known]:String();
+    wifiInput=known==WIFI_FACTORY?String(WIFI_PASS):known>=0?wifiPass[known]:String();
     wifiEditing=true;wifiShowPass=false;wifiKeyMode=0;wifiNotice="";
-    if(known>=0)wifiDrawerJoin();
+    if(known!=-1)wifiDrawerJoin();
   } else if(y>=125&&y<169&&x>=360)wifiShowPass=!wifiShowPass;
   else if(y>=182&&y<374&&x>=40&&x<440) {
     int r=(y-182)/48,k=(x-40)/40;
@@ -2567,7 +2656,7 @@ static void wifiPoll() {
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_RUNNING && (int32_t)(now - wifiScanAt) < 15000) return;
     wifiScanning = false;
-    for (int i = 0; i <= WIFI_NETS_MAX; i++) wifiSeen[i] = 0;
+    wifiSeen.assign(wifiN,0); wifiFactorySeen=0;
     int best = -2, bestRssi = -1000;              // -1 = factory entry
     wifiNearN = 0;
     for (int k = 0; k < n; k++) {
@@ -2590,7 +2679,7 @@ static void wifiPoll() {
       if (kFactoryWifi && sid == WIFI_SSID) hit = -1;   // hidden nets have "" names
       for (int i = 0; i < wifiN; i++) if (wifiSsid[i] == sid) hit = i;
       if (hit == -2) continue;
-      int16_t& seen = wifiSeen[hit < 0 ? WIFI_NETS_MAX : hit];
+      int16_t& seen = (hit < 0 ? wifiFactorySeen : wifiSeen[hit]);
       if (!seen || rs > seen) seen = rs;
       if (rs > bestRssi) { bestRssi = rs; best = hit; }
     }
@@ -3533,6 +3622,8 @@ void loop() {
                                    // the paths that feed on their own)
 
   if (sdPoll()) {                      // card slotted while running
+    // Reload the newest committed list and migrate NVS fallback to this card.
+    wifiLoad();
     sdFontLoadAll();
     sessRelabel();                     // card titles vs folder names
     almanacFromCard(clockEpoch());
