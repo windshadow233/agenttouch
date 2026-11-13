@@ -23,13 +23,15 @@
 extern const uint8_t radioCaStart[] asm("_binary_x509_crt_bundle_start");
 extern const uint8_t radioCaEnd[] asm("_binary_x509_crt_bundle_end");
 namespace {
-constexpr uint32_t RATE=16000,CAP=RATE*8,PREBUFFER=RATE*3;
+constexpr uint32_t RATE=16000,CAP=RATE*30,PREBUFFER=RATE*8;
+uint32_t prebufferTarget=PREBUFFER,streamUnderruns=0;
 SemaphoreHandle_t mux=nullptr;
 struct Guard {Guard(){xSemaphoreTake(mux,portMAX_DELAY);}~Guard(){xSemaphoreGive(mux);}};
 Preferences prefs;
 std::atomic<bool> initialized{false};
 std::atomic<uint32_t> rssBytes{0},rssRequests{0};
 std::atomic<int> rssHttpStatus{0};
+std::atomic<uint32_t> audioNetBytes{0},audioNetWaitMax{0},audioReconnects{0};
 bool enabled=false,want=false,refresh=false,eof=false,buffering=true,decoding=false;
 uint32_t feedGeneration=1; // RSS requests are independent of playback cancellation
 uint32_t generation=1,head=0,tail=0,fill=0,played=0,baseSec=0,underruns=0,audioStart=0;
@@ -84,7 +86,7 @@ void feedFail(uint32_t g,const String& why){
  if(!want && episodes.empty())state="error";
 }
 void fail(uint32_t g,const String& why){Guard l;if(g==generation){error=why;state="error";want=false;}}
-void clearBuffer(){head=tail=fill=played=0;buffering=true;eof=false;}
+void clearBuffer(){head=tail=fill=played=0;buffering=true;eof=false;prebufferTarget=PREBUFFER;streamUnderruns=0;}
 
 // Metadata only, on an already-mounted SD card. Never format storage here.
 bool cacheStorageReady=false,cachePending=true;
@@ -321,10 +323,16 @@ public:
  bool open(const String& url,uint64_t offset=0){
   if(!urlOK(url)){problem="invalid HTTP(S) URL";return false;}
   requestUrl=url;startOffset=offset;total=0;resourceSize=0;validator="";
+  if(!feedReader){audioNetBytes=0;audioNetWaitMax=0;audioReconnects=0;}
   segmentLimit=feedReader?65536:0;return openAt(offset);
+ }
+ bool buffered(){
+  if(ended || remaining==0)return false;
+  auto* stream=http.getStreamPtr();return stream && stream->available()>0;
  }
  int read(uint8_t* out,size_t n){
   if(!n)return 0;
+  uint32_t began=millis();
   unsigned retries=0;
   while(active()){
    // A fully received range is a segment boundary, not the end of the RSS.
@@ -332,12 +340,17 @@ public:
     if(!reopenAt(position()))return -1;
    }
    int got=readOnce(out,n);
-   if(got>0){total+=got;if(feedReader)rssBytes=total;return got;}
+   if(got>0){
+    total+=got;
+    if(feedReader)rssBytes=total;
+    else {audioNetBytes+=got;audioNetWaitMax=std::max(audioNetWaitMax.load(),(uint32_t)(millis()-began));}
+    return got;
+   }
    if(!got && (!resourceSize||position()>=resourceSize))return 0;
    if(!recoverable || !validator.length() || retries++>=3)return -1;
    // Reconnect at the exact byte already delivered to the parser/decoder.
    // The existing PCM ring continues to play while the connection is restored.
-   String cause=problem;
+   String cause=problem;if(!feedReader)audioReconnects++;
    Serial.printf("radio: %s resume at %llu: %s\n",feedReader?"RSS":"audio",(unsigned long long)position(),cause.c_str());
    bool opened=false;
    while(active() && retries<=3){
@@ -434,14 +447,19 @@ void playStream(uint32_t g,const radiofeed::Episode& ep,uint32_t position,int ra
    used=0;
   }else{Guard l;if(g==generation)audioStart=0;}
  }
- bool done=false,decoded=false;int16_t* mono=monoBlock.get();uint32_t count=0;
+ bool done=false,decoded=false,needsInput=false;int16_t* mono=monoBlock.get();uint32_t count=0;
  uint32_t noAudioAt=millis();
  auto emit=[&](int16_t value){mono[count++]=value;if(count==1024){if(!putSamples(g,mono,count))return false;count=0;}return true;};
  while(alive(g)){
-  if(!done&&used<16384){int n=reader.read(input.get()+used,32768-used);if(n<0){fail(g,reader.problem);return;}if(n)used+=n;else done=true;}
+  // Do not wait on the network while complete MP3 frames are still buffered.
+  if(radioNeedsInput(used,done,needsInput,DRMP3_MAX_FREE_FORMAT_FRAME_SIZE,[&](){return reader.buffered();})) {
+   int n=reader.read(input.get()+used,32768-used);
+   if(n<0){fail(g,reader.problem);return;}
+   if(n)used+=n;else done=true;
+  }
   if(!used&&done)break;
   drmp3dec_frame_info frame={};int samples=drmp3dec_decode_frame(decoder.get(),input.get(),used,pcm.get(),&frame);
-  int consumed=frame.frame_bytes;
+  int consumed=frame.frame_bytes;needsInput=consumed<=0;
   if(consumed>0&&consumed<=used){used-=consumed;memmove(input.get(),input.get()+consumed,used);}
   else if(done)break;
   else if(used>=16384){memmove(input.get(),input.get()+used-3,3);used=3;}
@@ -552,9 +570,11 @@ void radioSeek(int32_t delta){if(!initialized)return;Guard l;
 bool radioSeekTo(uint32_t seconds){if(!initialized)return false;Guard l;return radioSeekLocked(seconds);}
 bool radioPlaying(){if(!initialized)return false;Guard l;return enabled&&want;}
 bool radioWantPlay(){if(!initialized)return false;Guard l;return enabled&&want&&!buffering&&fill>0;}
+float radioBufferedSeconds(){if(!initialized)return 0;Guard l;return enabled?(float)fill/RATE:0.0f;}
 uint32_t radioPull(int16_t* out,uint32_t maxSamples){
  if(!initialized)return 0;Guard l;if(!enabled||!want||buffering)return 0;
- if(!fill){if(!eof){buffering=true;state="buffering";++underruns;}return 0;}
+ if(!fill){if(!eof){buffering=true;state="buffering";++underruns;++streamUnderruns;
+   prebufferTarget=std::min(RATE*16,prebufferTarget+RATE*2);}return 0;}
  uint32_t n=std::min(fill,maxSamples),first=std::min(n,CAP-tail);
  memcpy(out,ring+tail,first*sizeof(int16_t));if(n>first)memcpy(out+first,ring,(n-first)*sizeof(int16_t));
  tail=(tail+n)%CAP;fill-=n;played+=n;return n;
@@ -581,7 +601,7 @@ const PlayerInfo& radioInfo(){
 void radioPoll(){
  if(!initialized)return;bool kick=false,next=false;int index=-1;
  {Guard l;if(!enabled)return;
-  if(want&&buffering&&(fill>=PREBUFFER||(eof&&fill))){buffering=false;state="playing";}
+  if(want&&buffering&&(fill>=prebufferTarget||(eof&&fill))){buffering=false;state="playing";}
   kick=want&&!buffering&&fill>0;
   if(want&&eof&&!fill&&!episodes.empty()){next=true;index=(selected+1)%episodes.size();}
  }
@@ -592,5 +612,7 @@ void radioStatus(JsonObject out){
  Guard l;out["cache_storage"]=cacheStorageReady;out["cache_error"]=cacheNote;out["enabled"]=enabled;out["feed"]=feedUrl;out["state"]=state;out["error"]=error.length()?error:feedError;out["refreshing"]=refresh;out["refresh_error"]=feedError;
  out["wifi"]=WiFi.status()==WL_CONNECTED;out["count"]=episodes.size();out["index"]=selected;
  out["pos"]=baseSec+played/RATE;out["buffer_s"]=(double)fill/RATE;out["underruns"]=underruns;
+ out["buffer_capacity_s"]=CAP/RATE;out["prebuffer_s"]=prebufferTarget/RATE;out["stream_underruns"]=streamUnderruns;
+ out["audio_bytes"]=audioNetBytes.load();out["audio_wait_max_ms"]=audioNetWaitMax.load();out["audio_reconnects"]=audioReconnects.load();out["rssi"]=WiFi.RSSI();
 
 }

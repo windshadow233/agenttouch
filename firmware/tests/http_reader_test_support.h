@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cassert>
 #include <atomic>
+std::atomic<uint32_t> audioNetBytes{0},audioNetWaitMax{0},audioReconnects{0};
 std::atomic<uint32_t> rssBytes{0},rssRequests{0};std::atomic<int> rssHttpStatus{0};
 #include "http_range.h"
 class String:public std::string {

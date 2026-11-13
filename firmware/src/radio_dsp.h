@@ -1,5 +1,11 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
+// Only block for more data when the decoder actually needs it.
+template<class Available>
+bool radioNeedsInput(size_t used,bool done,bool needsInput,size_t frameReserve,Available available){
+ return !done&&(needsInput||used<frameReserve||(used<16384&&available()));
+}
 // Stateful linear resampler; output goes directly into a bounded PCM ring.
 struct RadioResampler {
   int rate=0,phase=0;int16_t previous=0;bool primed=false;

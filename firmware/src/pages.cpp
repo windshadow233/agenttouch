@@ -1045,6 +1045,15 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
       int fill = (int)(SLIDER_W * (pos / dur));
       if (fill < 0) fill = 0;
       if (fill > SLIDER_W) fill = SLIDER_W;
+      // Network podcasts expose decoded PCM ahead of the playhead. Do not
+      // imply cached data at a seek-preview position or for Mac playback.
+      if(!mac && !seeking && radioEnabled()) {
+        float ahead=radioBufferedSeconds();
+        float end=std::min(dur,pos+ahead);
+        int buffered=std::min((int)SLIDER_W,(int)ceilf(SLIDER_W*end/dur));
+        if(ahead>0 && buffered>fill && buffered>=4)
+          c->fillRoundRect(SLIDER_X,SLIDER_Y,buffered,4,2,AL_GREY);
+      }
       if (fill >= 4) c->fillRoundRect(SLIDER_X, SLIDER_Y, fill, 4, 2, (playing||seeking) ? accent : AL_DIM);
       if(!mac)c->fillCircle(SLIDER_X+fill,SLIDER_Y+2,seeking?8:5,accent);
     }

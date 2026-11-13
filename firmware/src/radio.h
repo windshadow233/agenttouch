@@ -16,6 +16,7 @@ void radioSeek(int32_t delta);
 bool radioSeekTo(uint32_t seconds);
 bool radioPlaying();
 bool radioWantPlay();
+float radioBufferedSeconds(); // decoded audio ready to play, excluding network estimates
 uint32_t radioPull(int16_t* out, uint32_t maxSamples);
 int radioCount();
 bool radioEpisode(int index,char* title,size_t size,unsigned* duration=nullptr);
