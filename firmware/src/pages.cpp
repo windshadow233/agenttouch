@@ -266,13 +266,18 @@ static uint16_t blend565(uint16_t bg, uint16_t fg, uint8_t a) {   // a: 0..15
 }
 
 static const uint8_t* afGlyph(const AFont& f, uint32_t cp) {
+  // Full CJK faces live on SD; keep flash glyphs as a no-card fallback.
+  if(cp>=0x80 && f.sd>=0) {
+    const uint8_t* card=sdFontGlyph((uint8_t)f.sd,cp);
+    if(card)return card;
+  }
   int lo = 0, hi = f.n - 1;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
     if (f.cp[mid] == cp) return f.data + f.off[mid];
     if (f.cp[mid] < cp) lo = mid + 1; else hi = mid - 1;
   }
-  return f.sd >= 0 ? sdFontGlyph((uint8_t)f.sd, cp) : nullptr;   // card fallback
+  return cp<0x80 && f.sd>=0 ? sdFontGlyph((uint8_t)f.sd,cp) : nullptr;
 }
 
 static uint32_t afDecode(const char*& p) {   // tiny UTF-8 decoder (BMP only)
@@ -1125,4 +1130,10 @@ int playZoneAt(int px, int py) {
   if (px < 160) return -1;
   if (px >= 320) return +1;
   return 0;
+}
+
+// Use the podcast page's generous transport band, without toggling the card.
+int macPlayZoneAt(int px,int py) {
+  if(px<0 || px>=480 || py<BAND_Y || py>=BAND_Y+BAND_H)return 2;
+  return playZoneAt(px,py);
 }

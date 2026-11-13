@@ -7,7 +7,7 @@
 // unpowered board (battery dead/removed = PMU power-on reset) loses it.
 // CLKOUT is unconnected, INT (GPIO13) unused for now, VBACKUP has only a cap.
 // Convention: the chip holds LOCAL time (timezone already applied) — exactly
-// what clockSet() takes; the whole firmware thinks in local seconds.
+// what clockSet() takes. System time is UTC for HTTPS certificate validation.
 #pragma once
 #include <Arduino.h>
 
@@ -24,6 +24,7 @@ struct RtcInfo {
 
 bool rtcInit();                                   // probe; seeds clockSet() when the chip has a usable time
 uint32_t rtcRead(bool* integrityOut = nullptr);   // local epoch from the chip, 0 if unusable
+void rtcApplyHostTime(uint32_t utcEpoch, int32_t offsetSeconds); // also seed system UTC and remember the offset
 void rtcHostSync(uint32_t hostLocalEpoch);        // rewrite the chip when it is >=2 s off or lost integrity
 const RtcInfo& rtcInfo();
 void rtcFormat(uint32_t localEpoch, char* out, size_t n);   // "2026-09-05 11:20:33", "--" for 0

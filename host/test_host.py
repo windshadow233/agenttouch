@@ -1581,6 +1581,59 @@ class NowPlayingAdvanceTests(unittest.TestCase):
         self.assertEqual(H.np_advance(NP_CHROME, 0.0), NP_CHROME)
 
 
+class NowPlayingTimedMergeTests(unittest.TestCase):
+    def line(self, **payload):
+        return {"type": "data", "diff": True, "payload": payload}
+
+    def test_stream_line_rebases_before_applying_pause(self):
+        state = dict(NP_CHROME, elapsedTime=10.0)
+        with mock.patch.dict(H.np_rt, {"payload": state, "pos_at": 100}), \
+             mock.patch.object(H.time, "time", return_value=105), \
+             mock.patch.object(H, "np_apply_state") as apply:
+            H.np_line(json.dumps(self.line(playing=False)))
+            self.assertEqual(H.np_rt["payload"]["elapsedTime"], 15.0)
+            self.assertEqual(H.np_rt["pos_at"], 105)
+            apply.assert_called_once()
+
+    def test_pause_without_position_keeps_elapsed_playback(self):
+        state = dict(NP_CHROME, elapsedTime=10.0)
+        merged, at = H.np_merge_timed(state, 100, self.line(playing=False, playbackRate=0), 105)
+        self.assertEqual(merged["elapsedTime"], 15.0)
+        self.assertEqual(at, 105)
+        self.assertEqual(H.np_advance(merged, 20)["elapsedTime"], 15.0)
+        self.assertEqual(state["elapsedTime"], 10.0)
+
+    def test_metadata_then_pause_does_not_lose_seconds(self):
+        state = dict(NP_CHROME, elapsedTime=10.0)
+        state, at = H.np_merge_timed(state, 100, self.line(artworkMimeType="image/jpeg"), 103)
+        state, at = H.np_merge_timed(state, at, self.line(playing=False), 107)
+        self.assertEqual(state["elapsedTime"], 17.0)
+
+    def test_resume_does_not_count_paused_time(self):
+        state = dict(NP_CHROME, elapsedTime=10.0, playing=False, playbackRate=0)
+        state, at = H.np_merge_timed(state, 100, self.line(playing=True, playbackRate=1), 150)
+        self.assertEqual(state["elapsedTime"], 10.0)
+        self.assertEqual(H.np_advance(state, 2)["elapsedTime"], 12.0)
+
+    def test_authoritative_pause_position_wins(self):
+        state, at = H.np_merge_timed(NP_CHROME, 100, self.line(playing=False, elapsedTime=12.75), 110)
+        self.assertEqual(state["elapsedTime"], 12.75)
+
+    def test_rate_change_uses_previous_rate_until_event(self):
+        state = dict(NP_CHROME, elapsedTime=10.0, playbackRate=2)
+        state, at = H.np_merge_timed(state, 100, self.line(playbackRate=1), 103)
+        self.assertEqual(state["elapsedTime"], 16.0)
+
+    def test_track_change_without_position_starts_at_zero(self):
+        state, at = H.np_merge_timed(NP_CHROME, 100, self.line(title="new song"), 105)
+        self.assertEqual(state["elapsedTime"], 0.0)
+
+    def test_ignored_events_keep_clock_anchor(self):
+        state, at = H.np_merge_timed(NP_CHROME, 100, {"type": "status"}, 105)
+        self.assertEqual(state, NP_CHROME)
+        self.assertEqual(at, 100)
+
+
 class NowPlayingMergeTests(unittest.TestCase):
     def test_full_line_replaces(self):
         st = H.np_merge({"title": "old", "album": "gone"},
@@ -1630,6 +1683,10 @@ class NowPlayingThrottleTests(unittest.TestCase):
         self.assertFalse(H.np_should_send(prev, cur, 1000.0, 1004.0))
         self.assertFalse(H.np_should_send(prev, cur, 1000.0, 1014.9))
         self.assertTrue(H.np_should_send(prev, cur, 1000.0, 1015.0))
+
+    def test_paused_position_correction_sends_immediately(self):
+        self.assertTrue(H.np_should_send(self.msg(play=0, pos=10),
+                                         self.msg(play=0, pos=13), 1000.0, 1000.1))
 
     def test_paused_entry_still_refreshes(self):
         prev = self.msg(play=0)

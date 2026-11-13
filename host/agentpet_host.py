@@ -6174,6 +6174,10 @@ def np_should_send(prev, cur, last_sent_at, now, refresh=NP_REFRESH_S):
         return True
     if not cur.get("on"):
         return False
+    # A precise position can arrive after the pause event. Send the correction
+    # now rather than leaving the frozen display wrong for another 15 seconds.
+    if not cur.get("play") and abs(np_num(cur.get("pos")) - np_num(prev.get("pos"))) >= 0.1:
+        return True
     return (now - last_sent_at) >= refresh
 
 def np_advance(state, secs):
@@ -6193,6 +6197,24 @@ def np_advance(state, secs):
     out = dict(state)
     out["elapsedTime"] = pos
     return out
+
+def np_merge_timed(state, pos_at, obj, now):
+    """Rebase partial events before applying pause/rate/metadata changes."""
+    if not isinstance(obj, dict) or obj.get("type") != "data" or not isinstance(obj.get("payload"), dict):
+        return dict(state or {}), pos_at
+    payload = obj["payload"]
+    if not obj.get("diff"):
+        return dict(payload), now
+    previous = np_advance(state or {}, max(0.0, now - pos_at))
+    merged = np_merge(previous, obj)
+    # A new track without a position must not inherit the previous song's clock.
+    identity = ("contentItemIdentifier", "uniqueIdentifier", "title", "bundleIdentifier")
+    changed = any(key in payload and key in (state or {}) and
+                  payload[key] != state[key] for key in identity)
+    if changed and "elapsedTime" not in payload:
+        merged["elapsedTime"] = 0.0
+    return merged, now
+
 
 def np_cover_hash(raw):
     """Cover id = md5 of the artwork's raw (decoded) bytes, first 12 hex."""
@@ -6398,8 +6420,8 @@ def np_line(line):
     except ValueError:
         return
     with np_lock:
-        np_rt["payload"] = np_merge(np_rt["payload"], obj)
-        np_rt["pos_at"] = time.time()      # elapsedTime was true as of now
+        np_rt["payload"], np_rt["pos_at"] = np_merge_timed(
+            np_rt["payload"], np_rt["pos_at"], obj, time.time())
     np_apply_state()
 
 def np_tick_loop():
@@ -7110,7 +7132,7 @@ def radio_request(op, feed=""):
 # Values under data-th keys are trusted HTML (they carry <code>).
 SETTINGS_T = {
  "zh": {
-  "radio_title": "板子独立联网播客", "radio_hint": "首次配置 RSS 后，板子自己联网刷新和播放，Mac 可以关闭。播放页保持原样，刷新和选集在板子上操作。当前支持 MP3 音频，不保存整集到 SD 卡。", "radio_feed": "RSS 订阅地址", "radio_save": "保存并启用", "radio_load": "读取板子设置", "radio_sd": "使用 SD 卡播客", "radio_sd_title": "下载到 SD 卡（原有方式）", "radio_idle": "连接板子后读取或保存 RSS 设置",
+  "radio_title": "板子独立联网播客", "radio_hint": "首次配置 RSS 后，板子自己联网刷新和播放，Mac 可以关闭。当前支持 MP3 音频，不保存整集到 SD 卡。", "radio_feed": "RSS 订阅地址", "radio_save": "保存并启用", "radio_load": "读取板子设置", "radio_sd": "使用 SD 卡播客", "radio_sd_title": "下载到 SD 卡（原有方式）", "radio_idle": "连接板子后读取或保存 RSS 设置",
 
   "title": "AgentTouch 设置", "lang_saved": "语言：中文",
   "loading": "读取中", "loading_dots": "读取中……", "board": "板子",

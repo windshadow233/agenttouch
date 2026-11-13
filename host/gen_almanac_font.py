@@ -56,6 +56,27 @@ PLAY_UI_CHARS = ("刷新列表返回加载网络重试播放中暂停上一页�
 ONLY = set()   # --sd <dir> --only tiny18 : bake just the named faces
 
 
+# Include fixed UI labels in the SD font charset alongside dynamic titles.
+# Read C++ literals rather than duplicating labels in the generator.
+UI_SOURCES = tuple(HERE.parent / "firmware" / "src" / name
+                   for name in ("main.cpp", "pages.cpp", "i18n.h"))
+
+
+def firmware_ui_chars(paths=None):
+    chars = set()
+    # Consume comments too, so quotes in comments cannot become UI literals.
+    tokens = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"')
+    for path in UI_SOURCES if paths is None else paths:
+        # The installed host may have no firmware checkout beside its copy.
+        if not path.is_file():
+            continue
+        for match in tokens.finditer(path.read_text()):
+            literal = match.group()
+            if literal.startswith('"'):
+                chars.update(c for c in literal[1:-1] if 0x80 <= ord(c) <= 0xFFFF)
+    return chars
+
+
 def find_face(path, want_family, want_styles):
     found = {}
     for idx in range(24):
@@ -193,7 +214,7 @@ def main_sd(outdir):
     st_idx, st_name = find_face(SONGTI, "Songti SC", ("Bold", "Black", "Regular"))
     hi_idx, hi_name = find_face(HIRAGINO, "Hiragino Sans GB", ("W6", "W3"))
     header_cs, body_cs = collect_charsets()
-    full = gb2312_chars() | set(header_cs) | set(body_cs)
+    full = gb2312_chars() | set(header_cs) | set(body_cs) | firmware_ui_chars()
     full = sorted(c for c in full if ord(c) >= 0x20)
     wide = sorted(set(full) | wide_chars())
     print(f"SD charset: {len(full)} glyphs (almanac faces), {len(wide)} (media faces)")

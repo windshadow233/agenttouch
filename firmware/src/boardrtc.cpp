@@ -4,11 +4,15 @@
 #include <Wire.h>
 #include <SensorPCF85063.hpp>
 #include <time.h>
+#include <sys/time.h>
+#include <Preferences.h>
 #include "pins.h"
 #include "pages.h"
 
 static SensorPCF85063 rtc;
 static RtcInfo info;
+static Preferences clockPrefs;
+static bool clockPrefsOpen=false;
 
 // Anything earlier is "never set": after a power-on reset the chip reads
 // 2000-01-01 (the driver adds 2000 to its two-digit year).
@@ -48,7 +52,32 @@ uint32_t rtcRead(bool* integrityOut) {
   return ep >= RTC_MIN_EPOCH ? ep : 0;
 }
 
+// The display/RTC keep local seconds; TLS and SNTP require real UTC.
+static bool systemUtcSet(uint32_t utc) {
+  if(utc<1700000000u)return false;
+  struct timeval tv={(time_t)utc,0};
+  return settimeofday(&tv,nullptr)==0;
+}
+static void systemUtcFromRtc(uint32_t local) {
+  if(!clockPrefsOpen || !clockPrefs.isKey("utc_off") || time(nullptr)>=1700000000)return;
+  int32_t off=clockPrefs.getInt("utc_off",0);
+  if(off < -14*3600 || off > 14*3600)return;
+  int64_t utc=(int64_t)local-off;
+  if(utc>=1700000000LL && utc<=UINT32_MAX)systemUtcSet((uint32_t)utc);
+}
+void rtcApplyHostTime(uint32_t utc,int32_t offset) {
+  int64_t local=(int64_t)utc+offset;
+  if(utc<1700000000u || offset < -14*3600 || offset > 14*3600 ||
+     local<=0 || local>UINT32_MAX)return;
+  if(clockPrefsOpen && (!clockPrefs.isKey("utc_off") || clockPrefs.getInt("utc_off",0)!=offset))
+    clockPrefs.putInt("utc_off",offset);
+  systemUtcSet(utc);
+  clockSet((uint32_t)local);
+  rtcHostSync((uint32_t)local);
+}
+
 bool rtcInit() {
+  clockPrefsOpen=clockPrefs.begin("rtc-clock",false);
   info = RtcInfo{};
   info.present = rtc.begin(Wire, PIN_I2C_SDA, PIN_I2C_SCL);
   if (!info.present) { Serial.println("rtc: PCF85063 not found"); return false; }
@@ -60,6 +89,7 @@ bool rtcInit() {
   rtcFormat(info.bootEpoch, buf, sizeof(buf));
   if (info.bootEpoch) {
     clockSet(info.bootEpoch);
+    systemUtcFromRtc(info.bootEpoch);
     info.seeded = true;
     Serial.printf("rtc: clock seeded from chip: %s\n", buf);
   } else {

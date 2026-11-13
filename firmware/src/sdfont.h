@@ -9,6 +9,7 @@
 
 enum SdFace : uint8_t { SDF_HEAD = 0, SDF_BODY = 1, SDF_QUOT = 2, SDF_TINY = 3, SDF_N = 4 };
 
+void sdFontPoll();                           // retry missing/failed card faces from loopTask
 void sdFontLoadAll();                        // (re)open every face; safe to call again
 bool sdFontReady(uint8_t face);
 const uint8_t* sdFontGlyph(uint8_t face, uint32_t cp);   // cached record, nullptr if absent

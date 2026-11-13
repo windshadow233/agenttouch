@@ -2389,7 +2389,7 @@ static void handleLine(const String& line) {
   } else if (strcmp(t, "time") == 0) {
     uint32_t epoch = d["epoch"] | 0u;  // host sends UTC + its utc offset
     int32_t  off   = d["off"] | 0;
-    if (epoch) { clockSet(epoch + off); rtcHostSync(epoch + off); }
+    if (epoch) rtcApplyHostTime(epoch,off);
   } else if (strcmp(t, "demo") == 0) {
     demoStart = millis();              // 8-face tour, or one face via "face"
     demoFace = -1;
@@ -3111,6 +3111,13 @@ static void podcastHoldPoll(int x, int y) {
   noteActivity();
 }
 
+// Mac now-playing has no seek gesture; horizontal drags are navigation.
+static int macPageSwipe(int sx,int sy,int ex,int ey) {
+  int dx=ex-sx,dy=ey-sy;
+  if(abs(dx)<=SWIPE_MIN_PX || abs(dx)<=2*abs(dy))return 0;
+  return dx>0?1:-1;
+}
+
 static void touchPoll() {
   if (!tpOk) return;
   if ((pendH || pendV) && (int32_t)(millis() - pendAt) > 300) execPendingSwipe();
@@ -3299,6 +3306,10 @@ static void touchPoll() {
           setCardUntil = nowMs + 12000;           // inside the card: keep it
         }
       }
+    } else if(shownPage==PAGE_CLOCK && clockView==CV_NP && macPageSwipe(sx,sy,ex,ey)) {
+      // Classify in the same frame used to draw the page and hit-test buttons.
+      // A viewed left swipe returns from Mac now-playing to the clock.
+      if(macPageSwipe(sx,sy,ex,ey)<0){clockView=CV_CLOCK;audioPlay(SND_TICK);}
     } else if (shownPage == PAGE_FACE) {
       if (wasPetting) {
         // lifting off after a petting session: no swipe/tap side effects
@@ -3411,11 +3422,11 @@ static void touchPoll() {
       }
       audioPlay(SND_TICK);
     } else if (shownPage == PAGE_CLOCK && clockView != CV_CLOCK &&
-               !vh && !hswipe && !vswipe) {
-      // compact card: the transport band is three 160×160
-      // zones — prev|toggle|next on 当前播放, -15 s|toggle|+15 s on 播客 —
-      // and the card itself is a toggle too. 300 ms debounce: a nervous
-      // double tap must not stack two toggles on the Mac.
+               !vh && !hswipe && !vswipe &&
+               (clockView!=CV_NP || (abs(ex-sx)<=18 && abs(ey-sy)<=18))) {
+      // Mac transport uses the same broad control band as podcasts.
+      // Podcast controls keep their existing transport zones and toolbar.
+      // Debounce prevents a double tap from stacking two Mac toggles.
       static uint32_t lastPlayTapAt = 0;
       uint32_t nowMs = millis();
       if ((int32_t)(nowMs - lastPlayTapAt) > 300) {
@@ -3427,9 +3438,15 @@ static void touchPoll() {
         // A tap that starts in the RSS footer cannot drift into transport.
         bool leftFooter=pageSrc()==PSRC_SD&&radioEnabled()&&
                         !radioListVisible()&&startY>=RADIO_FOOTER_TOP&&py<RADIO_FOOTER_TOP;
-        if (!leftFooter&&!(pageSrc()==PSRC_SD && radioPageTap(px,py)))
-          playAct(pageSrc(), playZoneAt(px, py));
-        audioPlay(SND_TICK);
+        if(pageSrc()==PSRC_MAC) {
+          int zone=macPlayZoneAt(px,py);
+          if(zone!=2) {
+            playAct(PSRC_MAC,zone);audioPlay(SND_TICK);
+          }
+        } else {
+          if(!leftFooter&&!radioPageTap(px,py))playAct(PSRC_SD,playZoneAt(px,py));
+          audioPlay(SND_TICK);
+        }
       }
     } else if ((shownPage == PAGE_CALENDAR ||
                 shownPage == PAGE_CLOCK) &&
@@ -3442,6 +3459,8 @@ static void touchPoll() {
         q["t"] = "qian"; q["pick"] = almanacPick();
         sendJson(q);
       }
+    } else if(shownPage==PAGE_CLOCK && clockView==CV_NP) {
+      // Sub-threshold/diagonal movement is neither a click nor a page switch.
     } else if (shownPage == PAGE_CALENDAR ||
                shownPage == PAGE_CLOCK) {
       // two-sided orientations, in the shared viewed frame (vdx above): a
@@ -3856,6 +3875,8 @@ void loop() {
     }
     prevSub = sub;
   }
+
+  sdFontPoll(); // recover SD font loading/reads without a reboot
 
   // no host on either link = a stale session list; the host pushes
   // a fresh one once it is back (and after a card swap re-label it)
