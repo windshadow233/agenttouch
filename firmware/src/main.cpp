@@ -1417,6 +1417,7 @@ static bool wifiRemember(const String& sid,const String& password) {
 // Kick off an async scan; wifiPoll() finishes it. Harmless while one runs.
 static void wifiStartScan() {
   if (wifiScanning) return;
+  wifiNearN=0; // a fresh scan must not display networks from a previous location
   if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
   wifiScanAt = millis();               // also on failure: retry in 30 s, not every pass
   if (WiFi.scanNetworks(true, false, false, 120) == WIFI_SCAN_FAILED) return;
@@ -1500,21 +1501,21 @@ static int wifiKnown(const String& ssid) {
   return kFactoryWifi && ssid==WIFI_SSID ? WIFI_FACTORY : -1;
 }
 static int wifiRows(std::vector<String>& rows) {
-  rows.clear();int n=0;
-  if (WiFi.status()==WL_CONNECTED) {rows.push_back(WiFi.SSID());n++;}
-  for (int i=0;i<wifiN;i++) {
-    bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiSsid[i]) found=true;
-    if(!found) {rows.push_back(wifiSsid[i]);n++;}
-  }
-  if(kFactoryWifi) {
-    bool found=false; for(int j=0;j<n;j++) if(rows[j]==WIFI_SSID) found=true;
-    if(!found) {rows.push_back(WIFI_SSID);n++;}
-  }
-  for(int i=0;i<wifiNearN;i++) {
-    bool found=false; for(int j=0;j<n;j++) if(rows[j]==wifiNear[i]) found=true;
-    if(!found) {rows.push_back(wifiNear[i]);n++;}
-  }
-  return n;
+  rows.clear();
+  if(wifiScanning)return 0;
+  // Preserve connected/saved priority, but only for SSIDs heard in this scan.
+  auto addVisible=[&](const String& sid) {
+    bool seen=false;
+    for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==sid)seen=true;
+    if(!seen)return;
+    for(const String& row:rows)if(row==sid)return;
+    rows.push_back(sid);
+  };
+  if(WiFi.status()==WL_CONNECTED)addVisible(WiFi.SSID());
+  for(const String& sid:wifiSsid)addVisible(sid);
+  if(kFactoryWifi)addVisible(WIFI_SSID);
+  for(int i=0;i<wifiNearN;i++)addVisible(wifiNear[i]);
+  return rows.size();
 }
 static void wifiDrawerJoin() {
   if(wifiScanning) { wifiNotice=langEn()?"Wait for scan":"请等待扫描完成"; return; }
@@ -1580,7 +1581,7 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
         wifiUiText(c,370-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
       }
     }
-    if(!n)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
+    if(!n && !wifiScanning)wifiUiText(c,80,190,langEn()?"No networks found":"未找到网络",muted);
     const char* footer=langEn()?"Swipe up from bottom to close":"滑动浏览 · 底部上滑关闭";
     wifiUiText(c,240-almanacTextWidthSmall(footer)/2,435,footer,muted);
     return;
