@@ -60,6 +60,25 @@ int main(){
  assert(macPageSwipe(100,100,200,160)==0);
  assert(macPageSwipe(100,100,140,180)==0);
  assert(macPageSwipe(100,100,108,110)==0);
+ // A pinned page can be viewed in every gravity sector. Convert a
+ // viewed right/up drag to native coordinates, then use the real mapping.
+ for(int rot=0;rot<4;rot++) {
+   shownRot=rot;
+   int x=240,y=240,rx=x,ry=y,ux=x,uy=y;
+   switch((4-rot)&3) {
+     case 1: ry+=100;ux+=100;break;
+     case 2: rx-=100;uy+=100;break;
+     case 3: ry-=100;ux-=100;break;
+     default: rx+=100;uy-=100;break;
+   }
+   int ax,ay,bx,by;
+   pageXY(x,y,ax,ay);pageXY(rx,ry,bx,by);
+   assert(bx-ax==100 && by==ay);
+   assert(macPageSwipe(ax,ay,bx,by)==1); // right: clock -> NP
+   assert(macPageSwipe(bx,by,ax,ay)==-1); // left: NP -> clock
+   pageXY(ux,uy,bx,by);
+   assert(bx==ax && by-ay==-100); // up: volume / reading
+ }
  int sx,sy,ex,ey;
  shownRot=3;pageXY(200,100,sx,sy);pageXY(220,200,ex,ey);
  assert(macPageSwipe(sx,sy,ex,ey)==1);

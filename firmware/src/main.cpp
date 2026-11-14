@@ -681,8 +681,8 @@ static void playAct(uint8_t src, int zone) {
   }
 }
 // Native touch point -> the page frame the clock-orientation pages were
-// drawn in (canvas rotation (4-shownRot)&3; same table as vdx/vdy above,
-// device-validated for the two-sided pages).
+// drawn in (canvas rotation (4-shownRot)&3). Side-page swipe deltas
+// are derived from these same coordinates.
 static void pageXY(int x, int y, int& px, int& py) {
   switch ((4 - shownRot) & 3) {
     // Inverse of Arduino_GFX's canvas rotation: convert native touch
@@ -3256,6 +3256,14 @@ static void touchPoll() {
     bool vh = abs(vdx) > SWIPE_MIN_PX && abs(vdx) > 2 * abs(vdy);
     bool vv = abs(vdy) > VSWIPE_MIN_PX && 2 * abs(vdy) > 3 * abs(vdx);
     int sx,sy,ex,ey;pageXY(tpStartX,tpStartY,sx,sy);pageXY(tpLastX,tpLastY,ex,ey);
+    // Side pages use the same inverse canvas transform for taps and swipes.
+    // The legacy face mapping above reverses both axes at odd rotations;
+    // using it here made navigation change direction after a pinned turn.
+    if (shownPage != PAGE_FACE) {
+      vdx = ex - sx; vdy = ey - sy;
+      vh = abs(vdx) > SWIPE_MIN_PX && abs(vdx) > 2 * abs(vdy);
+      vv = abs(vdy) > VSWIPE_MIN_PX && 2 * abs(vdy) > 3 * abs(vdx);
+    }
     if(!claimShowing() && !listening && (wifiDrawer || (sy<48 && ey-sy>60 && abs(ex-sx)*2<ey-sy))) {
       pendH=pendV=0;tpConsumed=false;lastTapAt=0;
       if(!wifiDrawer) {
@@ -3400,12 +3408,8 @@ static void touchPoll() {
         if (!half) lastTapAt = nowMs;
       }
     } else if (shownPage == PAGE_CALENDAR && almanacView && vv) {
-      // 换一签 (2026-09-22, user): up = next reading, down
-      // = previous, five readings wrap. The odd-rotation sign flip below is
-      // the play page's, and this strip is the other odd rotation (sector 1),
-      // so it carries over unchanged. Coming back round to the own draw shows
-      // a pill toast.
-      int up = (((4 - shownRot) & 3) & 1) ? (vdy > 0) : (vdy < 0);
+      // Viewed up advances the reading, at every rotation.
+      int up = vdy < 0;
       if (almanacAltCount() > 0) {
         int pick = almanacPickStep(up ? +1 : -1);
         audioPlay(pick == 0 ? SND_SELECT : SND_TICK);
@@ -3414,16 +3418,8 @@ static void touchPoll() {
         audioPlay(SND_TICK);                         // nothing to cycle yet (old host / old card file)
       }
     } else if (shownPage == PAGE_CLOCK && clockView != CV_CLOCK && vv) {
-      // 播放页 up/down = volume ±10, like the face page; the toast is the
-      // bar along the bottom band. Immediate: the petting deferral is a
-      // face-page problem only. Sign: the shared table's vdy row for canvas
-      // rotation 3 read inverted here — user 2026-09-09 morning: an up-swipe
-      // on the podcast page made it softer — so this page flips it (the face
-      // page's in-hand rows stay as validated). Same afternoon the clock
-      // strip moved to the other side, canvas rotation 1 on the desk: rows
-      // 1 and 3 of the table are 180° twins, so the inversion carries over —
-      // flip on both odd rotations.
-      int up = (((4 - shownRot) & 3) & 1) ? (vdy > 0) : (vdy < 0);
+      // Viewed up raises volume (or advances the podcast list).
+      int up = vdy < 0;
       if(clockView==CV_POD&&radioListVisible())radioListStep(up?1:-1);
       else {
         audioSetVolume(audioVolume() + (up ? 10 : -10));
@@ -3484,12 +3480,12 @@ static void touchPoll() {
           audioPlay(almanacView != langEn() ? SND_TICK : SND_SELECT);   // home = tick, away = select
         }
       } else {
-        // 三联页 (user 2026-09-09): 播客 ←右滑← 钟表 →左滑→ 当前播放,
+        // Page positions: Mac now-playing | clock | podcasts.
         // no wrap — the two players never reach each other directly.
-        if (vdx > SWIPE_MIN_PX) {
+        if (vdx < -SWIPE_MIN_PX) {
           if (clockView == CV_CLOCK)   { clockView = CV_POD;   audioPlay(SND_SELECT); }
           else if (clockView == CV_NP) { clockView = CV_CLOCK; audioPlay(SND_TICK); }
-        } else if (vdx < -SWIPE_MIN_PX) {
+        } else if (vdx > SWIPE_MIN_PX) {
           if (clockView == CV_POD)        { clockView = CV_CLOCK; audioPlay(SND_TICK); }
           else if (clockView == CV_CLOCK) { clockView = CV_NP;    audioPlay(SND_SELECT); }
         }

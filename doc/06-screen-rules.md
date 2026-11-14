@@ -46,7 +46,7 @@ Edges are named with the screen facing you and the three keys on top. See [Hardw
 | Placement | Home page | Swipe left / right | Swipe up / down |
 |---|---|---|---|
 | Standing, keys up | Face page | Switch seat (left = next seat to the right) | Volume ±10 |
-| Left edge down (microSD) | Clock | Left: now playing on the Mac. Right: board podcasts. No wrap. | Volume, on the two play pages |
+| Left edge down (microSD) | Clock | Swipe left: board podcasts on the right. Swipe right: Mac now-playing on the left. No wrap. | Volume, on the two play pages |
 | Right edge down (speaker) | Cyber almanac | Either way: almanac ⇄ calendar | On the almanac: another fortune |
 | Face down | Sleep | — | — |
 | Flat on its back | Keeps the last page | — | — |
