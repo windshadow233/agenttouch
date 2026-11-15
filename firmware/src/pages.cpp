@@ -916,11 +916,28 @@ static void pmVolume(Arduino_Canvas* c, uint8_t vol, float k) {
 // toolbar and a temporary episode picker are added to the podcast page.
 static bool netList=false;
 static int netListPage=0;
+static bool netJump=false;
+static int netJumpValue=0;
 bool radioListVisible(){return radioEnabled()&&netList;}
-void radioListStep(int dir){int pages=std::max(1,(radioCount()+3)/4);netListPage=((netListPage+dir)%pages+pages)%pages;}
+void radioListStep(int dir){if(netJump)return;int pages=std::max(1,(radioCount()+3)/4);netListPage=((netListPage+dir)%pages+pages)%pages;}
 bool radioPageTap(int px,int py){
  if(!radioEnabled())return false;
  if(netList){
+  if(netJump){
+   if(py>=402){
+    if(px<160){netJump=false;return true;}
+    if(px<320){netJumpValue/=10;return true;}
+    if(netJumpValue>=1&&netJumpValue<=std::max(1,(radioCount()+3)/4)){netListPage=netJumpValue-1;netJump=false;}
+    return true;
+   }
+   if(px>=48&&px<432&&py>=106&&py<386){
+    int key=((py-106)/70)*3+(px-48)/128;
+    int digit=key<9?key+1:key==10?0:-1;
+    if(digit>=0&&netJumpValue<= (2147483647-digit)/10)netJumpValue=netJumpValue*10+digit;
+   }
+   return true;
+  }
+  if(py>=8&&py<52){netJump=true;netJumpValue=0;return true;}
   if(py>=76&&py<396){int row=(py-76)/80;int index=netListPage*4+row;if(index<radioCount()){radioSelect(index,true);netList=false;}return true;}
   if(py>=RADIO_FOOTER_TOP){
    if(py>=402&&py<480){if(px>=12&&px<158)radioListStep(-1);else if(px>=322&&px<468)radioListStep(1);else if(px>=166&&px<314)netList=false;}
@@ -931,7 +948,7 @@ bool radioPageTap(int px,int py){
  if(py>=RADIO_FOOTER_TOP){
   if(py>=402&&py<480){
    if(px>=12&&px<236){radioRefresh();return true;}
-   if(px>=244&&px<468){netList=true;netListPage=0;return true;}
+   if(px>=244&&px<468){netList=true;netJump=false;netListPage=std::max(0,radioInfo().index)/4;return true;}
   }
   return true; // blank toolbar area is not a play/pause button
  }
@@ -944,7 +961,20 @@ static void radioButton(Arduino_Canvas* c,int x,int y,int w,const char* title){
 }
 static void radioListDraw(Arduino_Canvas* c,uint16_t accent){
  c->fillScreen(BG);radioListStep(0);
- char count[40];int n=radioCount();snprintf(count,sizeof count,"%d / %d",netListPage+1,std::max(1,(n+3)/4));
+ if(netJump){
+  char heading[64];snprintf(heading,sizeof heading,langEn()?"Page: %d / %d":"页码: %d / %d",netJumpValue,std::max(1,(radioCount()+3)/4));
+  afPrint(c,AF_TINY,240-afWidth(AF_TINY,heading)/2,70,heading,AL_WHITE);
+  for(int key=0;key<12;key++){
+   if(key==9||key==11)continue;
+   char digit[2]={(char)('0'+(key<9?key+1:0)),0};
+   radioButton(c,48+(key%3)*128,106+(key/3)*70,112,digit);
+  }
+  radioButton(c,20,408,130,langEn()?"Cancel":"取消");
+  radioButton(c,174,408,132,langEn()?"Delete":"删除");
+  radioButton(c,330,408,130,langEn()?"Go":"跳转");
+  return;
+ }
+ char count[40];int n=radioCount();snprintf(count,sizeof count,langEn()?"%d / %d  Tap to jump":"%d / %d  点击跳页",netListPage+1,std::max(1,(n+3)/4));
  afPrint(c,AF_TINY,240-afWidth(AF_TINY,count)/2,39,count,AL_GREY);
  char status[128];afFit(status,sizeof status,AF_TINY,radioInfo().show,440);
  afPrint(c,AF_TINY,20,70,status,AL_GREY);

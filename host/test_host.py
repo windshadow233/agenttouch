@@ -3999,7 +3999,7 @@ class LangTests(unittest.TestCase):
     def test_phrases_follow_lang_and_zh_is_unchanged(self):
         H.LANG = "zh"
         self.assertEqual(H.phrase_needs("claude"), "主人，Claude在等你哦！")
-        self.assertEqual(H.phrase_done("qoderwork"), "千问干完活啦！")
+        self.assertEqual(H.phrase_done("qoderwork"), "主人，千问干完活啦！")
         H.LANG = "en"
         self.assertEqual(H.phrase_needs("claude"), "Hey, Claude needs you!")
         self.assertEqual(H.phrase_done("codex"), "Codex is done!")

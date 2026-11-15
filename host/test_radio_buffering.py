@@ -28,7 +28,9 @@ class RadioBufferingTests(unittest.TestCase):
 #include <cassert>
 struct Guard{};
 bool initialized=true,enabled=true,want=true,buffering=false,eof=false;
-uint32_t head=0,tail=0,fill=0,played=0,underruns=0;
+uint32_t head=0,tail=0,fill=0,played=0,underruns=0,resumeSavedAt=0;
+uint32_t millis(){return 20000;}
+int saves=0;void saveResume(){saves++;}
 std::string state="playing";
 std::vector<int> episodes{1};int selected=0;
 void radioSelect(int,bool){} bool playerRunning(){return true;}void audioPlayerKick(){}
@@ -48,7 +50,8 @@ int main(){
  assert(CAP==RATE*30&&PREBUFFER==RATE*8);
  int16_t out[256];assert(radioBufferedSeconds()==0);assert(radioPull(out,256)==0);
  assert(buffering&&want&&underruns==1&&streamUnderruns==1&&prebufferTarget==RATE*10);
- fill=RATE*9;radioPoll();assert(buffering);
+ fill=RATE*9;radioPoll();assert(buffering&&saves==1);
+ radioPoll();assert(saves==1);
  fill=RATE*10;assert(radioBufferedSeconds()==10.0f);radioPoll();assert(!buffering&&state=="playing");
  tail=CAP-128;fill=256;
  for(int i=0;i<128;i++){ring[CAP-128+i]=i;ring[i]=i+128;}

@@ -12,6 +12,7 @@ struct Attempt {
 struct Plan {
   std::vector<Attempt> attempts;
   unsigned opens=0,pauses=0,live=0;
+  std::vector<size_t> offsets;
   bool active=true,cancelOnRead=false;
 };
 struct Reader {
@@ -19,7 +20,11 @@ struct Reader {
   std::string problem;int status=0;
   explicit Reader(Plan& p):plan(p) {assert(!p.live);p.live++;}
   ~Reader(){plan.live--;}
+  size_t delivered=0;
+  bool retryable()const{return !(status>=400&&status<500&&status!=408&&status!=429);}
+  bool resume(){return open();}
   bool open(){
+    plan.offsets.push_back(delivered);offset=0;
     assert(plan.opens<plan.attempts.size());attempt=plan.attempts[plan.opens++];
     status=attempt.status;problem="HTTP "+std::to_string(status);return status==200;
   }
@@ -30,7 +35,7 @@ struct Reader {
       return 0;
     }
     size_t take=std::min(n,attempt.body.size()-offset);
-    memcpy(out,attempt.body.data()+offset,take);offset+=take;return take;
+    memcpy(out,attempt.body.data()+offset,take);offset+=take;delivered+=take;return take;
   }
 };
 static Attempt response(const std::string& body,int status=200,bool interrupted=false){
@@ -39,16 +44,41 @@ static Attempt response(const std::string& body,int status=200,bool interrupted=
 static bool fetch(Plan& plan,radiofeed::Parser& parser,std::string& error){
   return radiofeed::fetchWithRetry(parser,error,
     [&](){return std::unique_ptr<Reader>(new Reader(plan));},
-    [&](){return plan.active;},[&](){assert(!plan.live);plan.pauses++;});
+    [&](){return plan.active;},[&](){assert(plan.live==1);plan.pauses++;});
 }
 int main(){
   std::string item="<item><title>One</title><enclosure url='https://example.test/1.mp3' type='audio/mpeg'/></item>";
   std::string second="<item><title>Two</title><enclosure url='https://example.test/2.mp3' type='audio/mpeg'/></item>";
   std::string full="<rss><channel><title>Show</title>"+item+second+"</channel></rss>";
   {
-    Plan p;p.attempts={response(item,200,true),response(full)};
+    std::string large="<rss><channel>";
+    for(int i=0;i<1200;i++)large+="<item><title>Episode</title><enclosure url='https://example.test/"+std::to_string(i)+".mp3'/></item>";
+    large+="</channel></rss>";
+    Plan p;p.attempts={response(large)};radiofeed::Parser parser;std::string error;
+    assert(fetch(p,parser,error));assert(parser.items.size()==1200);
+    auto merged=radiofeed::mergeCache(parser.items,{parser.items.back()});
+    assert(merged.size()==1200&&merged.back().url==parser.items.back().url);
+    auto summary=radiofeed::summarizeFetch(parser.items,{});
+    assert(summary.recent==1200&&summary.added==1200);
+  }
+  {
+    Plan p;p.attempts={response(item,200,true),response(second+"</channel></rss>")};
+    radiofeed::Parser parser;std::string error;
+    std::vector<std::pair<size_t,size_t>> progress;
+    bool ok=radiofeed::fetchWithRetry(parser,error,
+      [&](){return std::unique_ptr<Reader>(new Reader(p));},
+      [&](){return p.active;},[&](){p.pauses++;},3,
+      [&](size_t bytes,size_t items){progress.push_back({bytes,items});});
+    assert(ok&&progress.size()==3);
+    assert(progress[0]==std::make_pair(size_t(0),size_t(0)));
+    assert(progress[1]==std::make_pair(item.size(),size_t(1)));
+    assert(progress.back()==std::make_pair(item.size()+second.size()+size_t(16),size_t(2)));
+  }
+  {
+    Plan p;p.attempts={response(item,200,true),response(second+"</channel></rss>")};
     radiofeed::Parser parser;std::string error;
     assert(fetch(p,parser,error));assert(p.opens==2&&p.pauses==1&&!p.live);
+    assert(p.offsets==std::vector<size_t>({0,item.size()}));
     assert(parser.items.size()==2&&parser.items[0].title=="One"&&error.empty());
   }
   {

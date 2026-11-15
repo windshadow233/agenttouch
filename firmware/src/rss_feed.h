@@ -1,12 +1,14 @@
 // AgentTouch bounded RSS 2.0 parser: SAX-like, no whole-feed DOM.
 #pragma once
 #include <string>
+#include "rss_text.h"
 #include <vector>
 #include <cctype>
 #include <cstdlib>
+#include <functional>
 
 namespace radiofeed {
-struct Episode { std::string title, url; unsigned duration=0; };
+struct Episode { EpisodeText title, url; unsigned duration=0; };
 inline void utf8(std::string& out, unsigned c) {
   if(c<128) out+=(char)c;
   else if(c<2048){out+=(char)(192|(c>>6));out+=(char)(128|(c&63));}
@@ -59,7 +61,7 @@ class Parser {
     std::string name=base(t.substr(a,b==std::string::npos?b:b-a));
     if(!end&&name=="item"){inItem=true;item={};capture.clear();text.clear();}
     else if(end&&name=="item"){
-      if(inItem&&urlOK(item.url)&&items.size()<100){if(item.title.empty())item.title="Podcast";items.push_back(item);}
+      if(inItem&&urlOK(item.url)){if(item.title.empty())item.title="Podcast";items.push_back(item);itemCount++;if(onBatch&&items.size()>=16&&!onBatch(items))invalid=true;}
       inItem=false;capture.clear();text.clear();
     }else if(!end&&inItem&&name=="enclosure"){
       auto u=attr(t,"url");auto type=attr(t,"type");
@@ -76,7 +78,8 @@ class Parser {
     }
   }
 public:
-  std::vector<Episode> items;std::string show;bool invalid=false;size_t bytes=0;
+  std::vector<Episode> items;std::string show;bool invalid=false;size_t bytes=0,itemCount=0;
+  std::function<bool(std::vector<Episode>&)> onBatch;
   void put(char c){
     if(invalid)return;if(++bytes>4*1024*1024){invalid=true;return;}
     if(state==COMMENT){tail+=c;if(tail.size()>3)tail.erase(0,1);if(tail=="-->"){state=TEXT;tail.clear();}return;}

@@ -5650,8 +5650,9 @@ def phrase_needs(a):
 
 def phrase_done(a):
     if LANG == "en":
+
         return f"{SPEAK_NAMES_EN.get(a, a)} is done!"
-    return f"{SPEAK_NAMES.get(a, a)}干完活啦！"
+    return f"主人，{SPEAK_NAMES.get(a, a)}干完活啦！"
 
 def qian_text(pick=0):
     """The fortune the board is SHOWING: pick 0 = the day's own draw, 1..4 =

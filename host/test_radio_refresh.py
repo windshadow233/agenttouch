@@ -38,6 +38,7 @@ const uint32_t RATE=16000;
 String state="playing",error,feedError;
 std::vector<radiofeed::Episode> episodes;
 void saveResume(){saves++;}
+void saveSelection(){}
 uint32_t resumePosition(){return 11;}
 void clearBuffer(){fill=head=tail=played=0;buffering=true;eof=false;}
 '''
@@ -62,7 +63,7 @@ int main(){
  std::vector<radiofeed::Episode> fresh;
  for(int i=0;i<100;i++)fresh.push_back(episode("https://example.test/new"+std::to_string(i)+".mp3"));
  auto merged=radiofeed::mergeCache(fresh,episodes,episodes[0].url);
- assert(merged.size()==100&&radiofeed::episodeIndex(merged,episodes[0].url)>=0);
+ assert(merged.size()==102&&radiofeed::episodeIndex(merged,episodes[0].url)>=0);
  auto summary=radiofeed::summarizeFetch({episodes[0],fresh[0],fresh[0]},episodes);
  assert(summary.recent==2&&summary.added==1);
  auto repeat=radiofeed::summarizeFetch(episodes,episodes);

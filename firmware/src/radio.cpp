@@ -29,8 +29,10 @@ SemaphoreHandle_t mux=nullptr;
 struct Guard {Guard(){xSemaphoreTake(mux,portMAX_DELAY);}~Guard(){xSemaphoreGive(mux);}};
 Preferences prefs;
 std::atomic<bool> initialized{false};
-std::atomic<uint32_t> rssBytes{0},rssRequests{0};
+std::atomic<uint32_t> rssBytes{0},rssRequests{0},rssItems{0};
 std::atomic<int> rssHttpStatus{0};
+std::atomic<bool> rssParsing{false};
+std::atomic<uint32_t> rssDownloadMs{0},rssParseMs{0},rssReadFree{0},rssReadLargest{0};
 std::atomic<uint32_t> audioNetBytes{0},audioNetWaitMax{0},audioReconnects{0};
 bool enabled=false,want=false,refresh=false,eof=false,buffering=true,decoding=false;
 uint32_t feedGeneration=1; // RSS requests are independent of playback cancellation
@@ -43,6 +45,17 @@ unsigned fetchDoneCount=0,fetchDoneNew=0;
 String feedUrl,error,state="idle",show;
 std::vector<radiofeed::Episode> episodes;
 PlayerInfo info={};
+String lastEpisode;
+uint32_t resumeSavedAt=0;
+int restoredSelection(){
+ int index=radiofeed::episodeIndex(episodes,std::string(lastEpisode.c_str()));
+ return index>=0?index:0;
+}
+void saveSelection(){
+ if(selected<0||selected>=(int)episodes.size())return;
+ String url=episodes[selected].url.c_str();
+ if(url!=lastEpisode){lastEpisode=url;prefs.putString("last_episode",url);}
+}
 
 // Bounded NVS history, independent of the SD metadata cache and list order.
 struct ResumePoint {uint64_t id;uint32_t seconds,used;};
@@ -63,6 +76,7 @@ uint32_t resumePosition(){
 // Caller holds mux. Save the consumed position, never the decoder's read-ahead.
 void saveResume(){
  if(selected<0||selected>=(int)episodes.size())return;
+ saveSelection();
  uint64_t id=episodeId(episodes[selected].url);
  uint32_t seconds=eof&&!fill?0:baseSec+played/RATE;
  ResumePoint* slot=&resumePoints[0];
@@ -105,33 +119,33 @@ struct CacheAllocator : ArduinoJson::Allocator {
 bool cacheLoad(fs::FS& fs,uint32_t g,const String& url){
  std::vector<radiofeed::Episode> best;String cachedShow;uint64_t bestSeq=0;
  for(const char* path:CACHE_SLOTS){
-  File file=fs.open(path,FILE_READ);if(!file||file.size()>160*1024){if(file)file.close();continue;}
+  File file=fs.open(path,FILE_READ);if(!file){if(file)file.close();continue;}
   CacheAllocator allocator;JsonDocument doc(&allocator);auto err=deserializeJson(doc,file);file.close();if(err)continue;
   uint64_t seq=doc["seq"] | (uint64_t)0;
   cacheSequence=std::max(cacheSequence,seq); // worker owns the disk sequence
   if((doc["version"] | 0)!=1||String(doc["feed"] | "")!=url||seq<bestSeq)continue;
-  auto items=doc["items"].as<JsonArray>();if(items.isNull()||items.size()>radiofeed::CACHE_LIMIT)continue;
+  auto items=doc["items"].as<JsonArray>();if(items.isNull())continue;
   std::vector<radiofeed::Episode> valid;
   for(JsonObject item:items){radiofeed::Episode e;e.url=item["url"] | "";e.title=item["title"] | "";e.duration=item["dur"] | 0u;
    if(!radiofeed::urlOK(e.url)||e.title.size()>191||e.duration>7*86400u){valid.clear();break;}
    valid.push_back(e);
   }
-  if(!valid.empty()){best=radiofeed::mergeCache(valid,{});bestSeq=seq;cachedShow=doc["show"] | "";}
+  if(!valid.empty()){best=radiofeed::mergeCache(std::move(valid),{});bestSeq=seq;cachedShow=doc["show"] | "";}
  }
  if(best.empty())return false;
  Guard l;if(g!=generation||url!=feedUrl)return false;
  // Inserting a card during playback must not replace the current selection.
  if(!episodes.empty())return radiofeed::sameCache(episodes,best)&&show==cachedShow;
- episodes=std::move(best);show=cachedShow;selected=0;baseSec=resumePosition();refresh=false;want=false;state="idle";error="";
+ episodes=std::move(best);show=cachedShow;selected=restoredSelection();baseSec=resumePosition();refresh=false;want=false;state="idle";error="";
  return true;
 }
 bool cacheSave(fs::FS& fs,uint32_t g,const String& url){
  uint64_t nextSequence=cacheSequence+1;
  CacheAllocator allocator;JsonDocument doc(&allocator);doc["version"]=1;doc["feed"]=url;doc["seq"]=nextSequence;
  {Guard l;if(g!=generation||url!=feedUrl||episodes.empty())return false;doc["show"]=show;
-  JsonArray items=doc["items"].to<JsonArray>();for(const auto& e:episodes){JsonObject item=items.add<JsonObject>();item["title"]=e.title;item["url"]=e.url;item["dur"]=e.duration;}
+  JsonArray items=doc["items"].to<JsonArray>();for(const auto& e:episodes){JsonObject item=items.add<JsonObject>();item["title"]=e.title.c_str();item["url"]=e.url.c_str();item["dur"]=e.duration;}
  }
- if(doc.overflowed()||measureJson(doc)>160*1024){Guard l;cacheNote="metadata cache too large";return false;}
+ if(doc.overflowed()){Guard l;cacheNote="metadata cache too large";return false;}
  String data;serializeJson(doc,data);
  if(!fs.exists("/agentpet")&&!fs.mkdir("/agentpet")){Guard l;cacheNote="SD cache directory unavailable";return false;}
  File tmp=fs.open(CACHE_TEMP,FILE_WRITE);
@@ -197,9 +211,9 @@ public:
 };
 class Reader {
  WiFiClient plain;RadioSecureClient tls;HTTPClient http;
- uint32_t gen,lastByte=0,chunk=0,segmentLimit=0;
+ uint32_t gen,lastByte=0,chunk=0;
  int remaining=-1;
- bool feedReader=false,chunked=false,needCRLF=false,ended=false,recoverable=false;
+ bool feedReader=false,chunked=false,needCRLF=false,ended=false,recoverable=false,resumeRejected=false;
  String requestUrl,validator;
  uint64_t startOffset=0,resourceSize=0,segmentEnd=0;
  bool active(){return feedReader?feedAlive(gen):alive(gen);}
@@ -215,7 +229,7 @@ class Reader {
    if((int32_t)(millis()-lastByte)>15000){problem="network timeout";recoverable=true;return -1;}
    vTaskDelay(pdMS_TO_TICKS(5));
   }
-  problem="cancelled or Wi-Fi disconnected";return -1;
+  recoverable=active();problem="cancelled or Wi-Fi disconnected";return -1;
  }
  bool line(String& out){
   out="";uint8_t c;
@@ -226,6 +240,11 @@ class Reader {
   problem="invalid chunk header";return false;
  }
  bool openAt(uint64_t offset){
+  // A Wi-Fi outage must not discard the reader's offset or RSS parser.
+  uint32_t waiting=millis();
+  while(active()&&WiFi.status()!=WL_CONNECTED&&(int32_t)(millis()-waiting)<30000)
+   vTaskDelay(pdMS_TO_TICKS(100));
+  if(!active()||WiFi.status()!=WL_CONNECTED){status=0;problem="Wi-Fi disconnected; resume pending";return false;}
   http.end();problem="";status=0;chunk=0;remaining=-1;
   chunked=needCRLF=ended=recoverable=false;
   http.setConnectTimeout(15000);http.setTimeout(5000);http.setReuse(false);http.useHTTP10(false);
@@ -240,9 +259,8 @@ class Reader {
   if(!ok){problem="could not open URL";return false;}
   const char* names[]={"Transfer-Encoding","Content-Range","Content-Type","Content-Encoding","ETag","Last-Modified"};
   http.collectHeaders(names,6);
-  if(offset||segmentLimit){
+  if(offset){
    String range="bytes="+decimal(offset)+"-";
-   if(segmentLimit)range+=decimal(offset+segmentLimit-1);
    http.addHeader("Range",range);
    if(offset&&validator.length())http.addHeader("If-Range",validator);
   }
@@ -259,14 +277,14 @@ class Reader {
    return false;
   }
   String encoding=http.header("Content-Encoding");encoding.toLowerCase();
-  if(encoding.length()&&encoding!="identity"){problem="unsupported HTTP content encoding: "+encoding;return false;}
-  if(offset&&status!=206){problem="server ignored HTTP resume range";return false;}
+  if(encoding.length()&&encoding!="identity"){resumeRejected=true;problem="unsupported HTTP content encoding: "+encoding;return false;}
+  if(offset&&status!=206){resumeRejected=true;problem="server ignored HTTP resume range; tap Fetch to restart";return false;}
   int length=http.getSize();
   if(status==206){
    radiohttp::Range range;
    if(!radiohttp::parseRange(http.header("Content-Range").c_str(),range)||
-      !radiohttp::validRange(range,offset,resourceSize,length,segmentLimit)){
-    problem="invalid HTTP resume range";return false;
+      !radiohttp::validRange(range,offset,resourceSize,length,0)){
+    resumeRejected=true;problem="invalid HTTP resume range";return false;
    }
    resourceSize=range.size;segmentEnd=range.last+1;
    if(range.last-range.first+1>INT32_MAX){problem="HTTP range too large";return false;}
@@ -278,7 +296,7 @@ class Reader {
   if(nextValidator.startsWith("W/"))nextValidator="";
   if(!nextValidator.length())nextValidator=http.header("Last-Modified");
   if(offset&&validator.length()&&nextValidator.length()&&validator!=nextValidator){
-   problem="HTTP resource changed during transfer";return false;
+   resumeRejected=true;problem="HTTP resource changed during transfer; tap Fetch to restart";return false;
   }
   if(!validator.length())validator=nextValidator;
   String te=http.header("Transfer-Encoding");te.toLowerCase();chunked=te.indexOf("chunked")>=0;
@@ -322,9 +340,20 @@ public:
  ~Reader(){http.end();}
  bool open(const String& url,uint64_t offset=0){
   if(!urlOK(url)){problem="invalid HTTP(S) URL";return false;}
-  requestUrl=url;startOffset=offset;total=0;resourceSize=0;validator="";
+  requestUrl=url;startOffset=offset;total=0;resourceSize=0;validator="";resumeRejected=false;
   if(!feedReader){audioNetBytes=0;audioNetWaitMax=0;audioReconnects=0;}
-  segmentLimit=feedReader?65536:0;return openAt(offset);
+  // Stream one response through the small parser buffer; Range is only for resume.
+  return openAt(offset);
+ }
+ bool retryable()const{
+  return !resumeRejected && !(status>=400&&status<500&&status!=408&&status!=429);
+ }
+ bool resume(){
+  if(!retryable())return false;
+  if(!validator.length()){
+   resumeRejected=true;problem="RSS server has no resume validator; tap Fetch to restart";return false;
+  }
+  return reopenAt(position());
  }
  bool buffered(){
   if(ended || remaining==0)return false;
@@ -346,7 +375,7 @@ public:
     else {audioNetBytes+=got;audioNetWaitMax=std::max(audioNetWaitMax.load(),(uint32_t)(millis()-began));}
     return got;
    }
-   if(!got && (!resourceSize||position()>=resourceSize))return 0;
+   if(!got && ((!resourceSize&&!recoverable)||(resourceSize&&position()>=resourceSize)))return 0;
    if(!recoverable || !validator.length() || retries++>=3)return -1;
    // Reconnect at the exact byte already delivered to the parser/decoder.
    // The existing PCM ring continues to play while the connection is restored.
@@ -373,7 +402,7 @@ bool clockReady(uint32_t g,bool feed=false){
  return false;
 }
 void fetchFeed(uint32_t g,const String& url){
- rssBytes=0;rssRequests=0;rssHttpStatus=0;
+ rssBytes=0;rssItems=0;rssRequests=0;rssHttpStatus=0;rssParsing=false;rssDownloadMs=0;rssParseMs=0;rssReadFree=0;rssReadLargest=0;
  if(!clockReady(g,true)){feedFail(g,"Clock sync failed; check Wi-Fi internet");return;}
  struct FeedReader : Reader {
   String url;
@@ -381,21 +410,104 @@ void fetchFeed(uint32_t g,const String& url){
   bool open(){return Reader::open(url);}
  };
  radiofeed::Parser parser;std::string problem;
- bool ok=radiofeed::fetchWithRetry(parser,problem,
-   [&](){return std::unique_ptr<FeedReader>(new FeedReader(g,url));},
-   [&](){return feedAlive(g);},
-   [&](){for(int i=0;i<10 && feedAlive(g);i++)vTaskDelay(pdMS_TO_TICKS(50));});
+ auto makeReader=[&](){return std::unique_ptr<FeedReader>(new FeedReader(g,url));};
+ auto active=[&](){return feedAlive(g);};
+ auto pause=[&](){for(int i=0;i<10 && feedAlive(g);i++)vTaskDelay(pdMS_TO_TICKS(50));};
+ bool ok=false;
+ fs::FS* fs=sdFs();
+ if(fs){
+  constexpr const char* temporary="/agentpet/rss-download.tmp";
+  constexpr const char* saved="/agentpet/rss.xml";
+  if(!fs->exists("/agentpet")&&!fs->mkdir("/agentpet")){feedFail(g,"SD RSS directory unavailable");return;}
+  constexpr const char* batchPath="/agentpet/rss-items.tmp";
+  File batches=fs->open(batchPath,FILE_WRITE);
+  if(!batches){feedFail(g,"SD RSS metadata file unavailable");return;}
+  // Each deliberate Fetch starts a new file; automatic retries append in place.
+  File file=fs->open(temporary,FILE_WRITE);
+  if(!file){feedFail(g,"SD RSS file unavailable");return;}
+  // Batch small TLS reads into 16 KB SD writes, allocated outside internal RAM.
+  std::unique_ptr<uint8_t,decltype(&free)> transfer((uint8_t*)ps_malloc(16384),free);
+  if(!transfer){file.close();feedFail(g,"Not enough PSRAM for RSS transfer");return;}
+  // Reserve DMA-capable memory before the episode list starts growing.
+  std::unique_ptr<uint8_t,decltype(&free)> sdRead((uint8_t*)heap_caps_malloc(2048,MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA),free);
+  if(!sdRead){file.close();feedFail(g,"Not enough internal RAM for SD read");return;}
+  uint32_t started=millis(),parseStarted=0;
+  auto prepareRead=[&](File& disk,size_t offset){
+   disk.close();disk=fs->open(temporary,FILE_READ);
+   if(!disk)return false;
+   disk.setBufferSize(512);
+   return disk.size()==rssBytes.load()&&disk.seek(offset);
+  };
+  auto readSaved=[&](File& disk,uint8_t* out,size_t count){
+   int n=(int)disk.read(sdRead.get(),std::min(count,(size_t)2048));
+   int savedError=errno;
+   rssReadFree=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+   rssReadLargest=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+   if(n>0)memcpy(out,sdRead.get(),n);
+   errno=savedError;return n;
+  };
+  auto saveBatch=[&](std::vector<radiofeed::Episode>& batch,bool final){
+   if(batch.empty()||(!final&&batch.size()<16))return true;
+   CacheAllocator allocator;JsonDocument doc(&allocator);
+   JsonArray items=doc.to<JsonArray>();
+   for(const auto& ep:batch){JsonObject entry=items.add<JsonObject>();entry["title"]=ep.title.c_str();entry["url"]=ep.url.c_str();entry["dur"]=ep.duration;}
+   if(doc.overflowed())return false;
+   size_t length=measureJson(doc);
+   std::unique_ptr<char,decltype(&free)> encoded((char*)ps_malloc(length+2),free);
+   if(!encoded)return false;
+   if(serializeJson(doc,encoded.get(),length+1)!=length)return false;
+   encoded.get()[length]='\n';
+   if(batches.write((const uint8_t*)encoded.get(),length+1)!=length+1)return false;
+   batches.flush();batch.clear();return true;
+  };
+  ok=radiofeed::fetchFileWithRetry(parser,problem,file,makeReader,active,pause,
+    [&](size_t bytes,size_t items,bool parsing){
+     rssBytes=bytes;rssItems=items;
+     if(parsing&&!rssParsing.load()){rssDownloadMs=millis()-started;parseStarted=millis();}
+     rssParsing=parsing;
+     if(parsing)rssParseMs=millis()-parseStarted;else rssDownloadMs=millis()-started;
+    },3,prepareRead,transfer.get(),16384,readSaved,saveBatch);
+  if(rssParsing.load())rssParseMs=millis()-parseStarted;else rssDownloadMs=millis()-started;
+  file.close();batches.close();
+  if(!feedAlive(g))return;
+  if(ok){
+   // Rebuild only the final PSRAM list; the parser kept at most 16 episodes.
+   batches=fs->open(batchPath,FILE_READ);
+   if(!batches){feedFail(g,"SD RSS metadata reopen failed");return;}
+   while(batches.available()){
+    int ch=batches.peek();
+    if(ch=='\n'||ch=='\r'||ch==' '||ch=='\t'){batches.read();continue;}
+    CacheAllocator allocator;JsonDocument doc(&allocator);
+    auto result=deserializeJson(doc,batches);
+    if(result||!doc.is<JsonArray>()){batches.close();feedFail(g,"SD RSS metadata read failed");return;}
+    for(JsonObject entry:doc.as<JsonArray>()){
+     radiofeed::Episode ep;ep.title=entry["title"] | "";ep.url=entry["url"] | "";ep.duration=entry["dur"] | 0u;
+     if(!radiofeed::urlOK(ep.url)){batches.close();feedFail(g,"SD RSS metadata invalid URL");return;}
+     parser.items.push_back(std::move(ep));
+    }
+   }
+   batches.close();
+   if(parser.items.size()!=parser.itemCount){feedFail(g,"SD RSS metadata count mismatch");return;}
+   fs->remove(batchPath);
+   if(fs->exists(saved)&&!fs->remove(saved)){feedFail(g,"SD RSS file replace failed");return;}
+   if(!fs->rename(temporary,saved)){feedFail(g,"SD RSS file save failed");return;}
+  }
+ }else{
+  // Preserve standalone playback without a card using the streaming parser.
+  ok=radiofeed::fetchWithRetry(parser,problem,makeReader,active,pause,3,
+    [&](size_t bytes,size_t items){rssBytes=bytes;rssItems=items;});
+ }
  if(!feedAlive(g))return;
  if(!ok){feedFail(g,String("RSS fetch failed: ")+problem.c_str());return;}
  bool changed=true;
  {Guard l;if(g!=feedGeneration || url!=feedUrl)return;
-  std::string current=selected>=0 && selected<(int)episodes.size()?episodes[selected].url:std::string();
+  std::string current=selected>=0 && selected<(int)episodes.size()?std::string(episodes[selected].url.c_str()):std::string();
   auto summary=radiofeed::summarizeFetch(parser.items,episodes);
-  auto merged=radiofeed::mergeCache(parser.items,episodes,current);
+  auto merged=radiofeed::mergeCache(std::move(parser.items),episodes,current);
   changed=!radiofeed::sameCache(merged,episodes)||show!=String(parser.show.c_str())||cacheNote.length();
   int next=radiofeed::episodeIndex(merged,current);
   bool preserve=next>=0;
-  episodes=std::move(merged);show=parser.show.c_str();selected=preserve?next:0;
+  episodes=std::move(merged);show=parser.show.c_str();selected=preserve?next:restoredSelection();
   // Reindex the current episode without touching its decoder, buffer or clock.
   if(!preserve)baseSec=resumePosition();
   refresh=false;feedError="";
@@ -524,6 +636,7 @@ bool radioInit(){
  mux=xSemaphoreCreateMutex();if(!mux)return false;
  ring=(int16_t*)ps_malloc(CAP*sizeof(int16_t));if(!ring)return false;
  prefs.begin("radio",false);feedUrl=prefs.getString("feed","");enabled=prefs.getBool("enabled",false)&&urlOK(feedUrl);
+ lastEpisode=prefs.getString("last_episode","");
  size_t resumeBytes=prefs.getBytesLength("resume_v1");
  if(resumeBytes&&resumeBytes<=sizeof resumePoints&&resumeBytes%sizeof(ResumePoint)==0)
   prefs.getBytes("resume_v1",resumePoints,resumeBytes);
@@ -554,7 +667,7 @@ void radioRefresh(){
  if(!want && episodes.empty())state="loading";
 }
 void radioSelect(int i,bool play){if(!initialized)return;Guard l;if(i<0||i>=(int)episodes.size())return;
- saveResume();selected=i;++generation;want=play;baseSec=resumePosition();bitrate=0;audioStart=0;clearBuffer();state=play?"buffering":"paused";error="";}
+ saveResume();selected=i;saveSelection();++generation;want=play;baseSec=resumePosition();bitrate=0;audioStart=0;clearBuffer();state=play?"buffering":"paused";error="";}
 void radioSkip(int delta){if(!initialized)return;int i,n;bool playing;{Guard l;i=selected;n=episodes.size();playing=want;}if(n)radioSelect((i+delta+n)%n,playing);}
 void radioToggle(){if(!initialized)return;Guard l;if(!enabled||episodes.empty())return;
  if(want){saveResume();want=false;state="paused";}else{want=true;if(state=="error"||(!decoding&&!eof)){baseSec+=played/RATE;++generation;clearBuffer();}state=buffering?"buffering":"playing";}}
@@ -589,7 +702,14 @@ const PlayerInfo& radioInfo(){
  Guard l;info.hasItems=!episodes.empty();info.playing=want;info.index=selected;info.posSec=baseSec+played/RATE;
  if(selected>=0&&selected<(int)episodes.size()){copyText(info.title,sizeof info.title,episodes[selected].title.c_str());info.durSec=episodes[selected].duration;}
  String status=show;if(state!="playing"&&state!="idle")status+=(status.length()?" / ":"")+state;
- if(refresh)status="fetching...";
+ if(refresh){
+  char message[80];
+  const char* format=rssParsing.load()?(langEn()?"Parsing %lu KB / %lu eps":"解析 %lu KB · %lu 集"):
+     (langEn()?"Fetching %lu KB / %lu eps":"下载 %lu KB · %lu 集");
+  snprintf(message,sizeof(message),format,
+           (unsigned long)(rssBytes.load()/1024),(unsigned long)rssItems.load());
+  status=message;
+ }
  else if((int32_t)(fetchDoneUntil-millis())>0) {
   char message[64];
   snprintf(message,sizeof(message),langEn()?"Latest %u / New %u":"最近 %u 集 · 新增 %u 集",fetchDoneCount,fetchDoneNew);
@@ -602,13 +722,14 @@ void radioPoll(){
  if(!initialized)return;bool kick=false,next=false;int index=-1;
  {Guard l;if(!enabled)return;
   if(want&&buffering&&(fill>=prebufferTarget||(eof&&fill))){buffering=false;state="playing";}
+  if(want&&(int32_t)(millis()-resumeSavedAt)>15000){saveResume();resumeSavedAt=millis();}
   kick=want&&!buffering&&fill>0;
   if(want&&eof&&!fill&&!episodes.empty()){next=true;index=(selected+1)%episodes.size();}
  }
  if(next)radioSelect(index,true);else if(kick&&!playerRunning())audioPlayerKick();
 }
 void radioStatus(JsonObject out){
- out["worker_stacks_psram"]=false;out["tls_all_psram"]=true;out["rss_received"]=rssBytes.load();out["rss_requests"]=rssRequests.load();out["rss_http_status"]=rssHttpStatus.load();out["system_utc"]=(uint32_t)time(nullptr);out["clock_ready"]=time(nullptr)>1700000000;out["host_utc_sync"]=true;out["http_resume"]=true;out["rss_segment_bytes"]=65536;out["background_refresh"]=true;out["tls_ca_reattach"]=true;out["tls_psram"]=true;out["internal_free"]=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);out["internal_largest"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);out["supported"]=true;out["cache_limit"]=radiofeed::CACHE_LIMIT;out["ready"]=initialized.load();if(!initialized)return;
+ out["worker_stacks_psram"]=false;out["tls_all_psram"]=true;out["rss_received"]=rssBytes.load();out["rss_requests"]=rssRequests.load();out["rss_parsed"]=rssItems.load();out["rss_parsing"]=rssParsing.load();out["rss_file_first"]=true;out["rss_download_ms"]=rssDownloadMs.load();out["rss_parse_ms"]=rssParseMs.load();out["rss_sd_batch_bytes"]=16384;out["rss_metadata_psram"]=true;out["rss_parse_batch_episodes"]=16;out["rss_sd_read_internal"]=true;out["rss_read_internal_free"]=rssReadFree.load();out["rss_read_internal_largest"]=rssReadLargest.load();out["rss_http_status"]=rssHttpStatus.load();out["system_utc"]=(uint32_t)time(nullptr);out["clock_ready"]=time(nullptr)>1700000000;out["host_utc_sync"]=true;out["http_resume"]=true;out["rss_segment_bytes"]=0;out["rss_streaming"]=true;out["background_refresh"]=true;out["tls_ca_reattach"]=true;out["tls_psram"]=true;out["internal_free"]=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);out["internal_largest"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);out["supported"]=true;out["cache_limit"]=nullptr;out["ready"]=initialized.load();if(!initialized)return;
  Guard l;out["cache_storage"]=cacheStorageReady;out["cache_error"]=cacheNote;out["enabled"]=enabled;out["feed"]=feedUrl;out["state"]=state;out["error"]=error.length()?error:feedError;out["refreshing"]=refresh;out["refresh_error"]=feedError;
  out["wifi"]=WiFi.status()==WL_CONNECTED;out["count"]=episodes.size();out["index"]=selected;
  out["pos"]=baseSec+played/RATE;out["buffer_s"]=(double)fill/RATE;out["underruns"]=underruns;
