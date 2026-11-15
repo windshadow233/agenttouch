@@ -447,6 +447,7 @@ void fetchFeed(uint32_t g,const String& url){
    errno=savedError;return n;
   };
   auto saveBatch=[&](std::vector<radiofeed::Episode>& batch,bool final){
+   if(!active())return false;
    if(batch.empty()||(!final&&batch.size()<16))return true;
    CacheAllocator allocator;JsonDocument doc(&allocator);
    JsonArray items=doc.to<JsonArray>();
@@ -475,6 +476,7 @@ void fetchFeed(uint32_t g,const String& url){
    batches=fs->open(batchPath,FILE_READ);
    if(!batches){feedFail(g,"SD RSS metadata reopen failed");return;}
    while(batches.available()){
+    if(!active()){batches.close();return;}
     int ch=batches.peek();
     if(ch=='\n'||ch=='\r'||ch==' '||ch=='\t'){batches.read();continue;}
     CacheAllocator allocator;JsonDocument doc(&allocator);
@@ -488,6 +490,7 @@ void fetchFeed(uint32_t g,const String& url){
    }
    batches.close();
    if(parser.items.size()!=parser.itemCount){feedFail(g,"SD RSS metadata count mismatch");return;}
+   if(!active())return;
    fs->remove(batchPath);
    if(fs->exists(saved)&&!fs->remove(saved)){feedFail(g,"SD RSS file replace failed");return;}
    if(!fs->rename(temporary,saved)){feedFail(g,"SD RSS file save failed");return;}
@@ -665,6 +668,12 @@ void radioRefresh(){
  if(!initialized)return;Guard l;if(!enabled || refresh)return;
  ++feedGeneration;cachePending=false;refresh=true;feedError="";fetchDoneUntil=0;
  if(!want && episodes.empty())state="loading";
+}
+bool radioRefreshing(){if(!initialized)return false;Guard l;return enabled&&refresh;}
+void radioCancelRefresh(){
+ if(!initialized)return;Guard l;if(!refresh)return;
+ ++feedGeneration;refresh=false;cachePending=false;feedError="";fetchDoneUntil=0;
+ if(state=="loading")state="idle";
 }
 void radioSelect(int i,bool play){if(!initialized)return;Guard l;if(i<0||i>=(int)episodes.size())return;
  saveResume();selected=i;saveSelection();++generation;want=play;baseSec=resumePosition();bitrate=0;audioStart=0;clearBuffer();state=play?"buffering":"paused";error="";}

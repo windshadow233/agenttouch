@@ -1988,6 +1988,7 @@ static void handleLine(const String& line) {
       ok = radioConfigure(d["feed"] | "", d["enabled"] | false);
     } else if (!strcmp(op,"disable")) radioDisable();
     else if (!strcmp(op,"refresh")) radioRefresh();
+    else if (!strcmp(op,"cancel")) radioCancelRefresh();
     else if (!strcmp(op,"select")) radioSelect(d["index"] | 0,true);
     else if (!strcmp(op,"pause")) radioPause();
     else if (strcmp(op,"status")) ok=false;

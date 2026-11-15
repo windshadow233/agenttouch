@@ -72,6 +72,21 @@ static void checkFileFetch(){
   [](){return std::unique_ptr<Feed>(new Feed);},[](){return running;},[](){},[](size_t,size_t,bool){}));
  assert(error.find("SD RSS file read failed at 0/")==0&&badRead.data==body);
 }
+static void checkFetchCancellation(){
+ const char* body="<rss><channel><item><title>One</title><enclosure url='https://example.test/1.mp3'/></item></channel></rss>";
+ reset();responses={response(body,strlen(body))};
+ MemoryFile file;radiofeed::Parser old;old.show="keep old list";std::string error;
+ assert(!radiofeed::fetchFileWithRetry(old,error,file,
+  [](){return std::unique_ptr<Feed>(new Feed);},[](){return running;},[](){assert(false);},
+  [](size_t bytes,size_t,bool parsing){if(bytes&&!parsing)running=false;}));
+ assert(requests.size()==1&&old.show=="keep old list"&&old.items.empty());
+ reset();responses={response(body,strlen(body))};
+ MemoryFile parsed;
+ assert(!radiofeed::fetchFileWithRetry(old,error,parsed,
+  [](){return std::unique_ptr<Feed>(new Feed);},[](){return running;},[](){assert(false);},
+  [](size_t,size_t,bool parsing){if(parsing)running=false;}));
+ assert(requests.size()==1&&old.show=="keep old list"&&old.items.empty());
+}
 static void checkBoundedBatches(){
  reset();std::string body="<rss><channel><title>Batch show</title>";
  for(int i=0;i<500;i++)body+="<item><title>Episode "+std::to_string(i)+"</title><enclosure url='https://example.test/"+std::to_string(i)+".mp3'/></item>";
@@ -97,7 +112,7 @@ static void checkBoundedBatches(){
  assert(error=="SD RSS metadata batch write failed"&&old.show=="old"&&old.items.empty());
 }
 int main(){
- checkFileFetch();checkBoundedBatches();
+ checkFileFetch();checkBoundedBatches();checkFetchCancellation();
  radiohttp::Range r;
  assert(radiohttp::parseRange("bytes 65536-131071/1751572",r));
  assert(radiohttp::validRange(r,65536,1751572,65536,65536));

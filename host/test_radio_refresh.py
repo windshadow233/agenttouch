@@ -60,6 +60,18 @@ int main(){
  radioToggle();assert(want&&refresh&&feedGeneration==request);
  assert(radioSeekLocked(50));assert(refresh&&baseSec==50&&want&&feedGeneration==request);
  radioSelect(0,true);assert(refresh&&selected==0&&want&&feedGeneration==request);
+ uint32_t playback=generation;uint32_t beforeCancel=feedGeneration;
+ uint32_t position=baseSec,pending=fill;int current=selected;
+ assert(radioRefreshing());radioCancelRefresh();
+ assert(!radioRefreshing()&&feedGeneration==beforeCancel+1&&generation==playback&&want);
+ assert(baseSec==position&&fill==pending&&selected==current&&episodes.size()==2);
+ feedFail(beforeCancel,"cancelled request failed");assert(feedError.empty());
+ radioCancelRefresh();assert(feedGeneration==beforeCancel+1); // idempotent
+ radioRefresh();assert(radioRefreshing()&&feedGeneration==beforeCancel+2);
+ feedFail(beforeCancel,"stale error");assert(radioRefreshing()&&feedError.empty());
+ radioCancelRefresh();episodes.clear();want=false;radioRefresh();assert(state=="loading");
+ radioCancelRefresh();assert(state=="idle"&&!refresh&&episodes.empty());
+ episodes={episode("https://example.test/1.mp3"),episode("https://example.test/2.mp3")};
  std::vector<radiofeed::Episode> fresh;
  for(int i=0;i<100;i++)fresh.push_back(episode("https://example.test/new"+std::to_string(i)+".mp3"));
  auto merged=radiofeed::mergeCache(fresh,episodes,episodes[0].url);

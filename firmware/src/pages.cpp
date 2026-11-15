@@ -947,7 +947,7 @@ bool radioPageTap(int px,int py){
  }
  if(py>=RADIO_FOOTER_TOP){
   if(py>=402&&py<480){
-   if(px>=12&&px<236){radioRefresh();return true;}
+   if(px>=12&&px<236){if(radioRefreshing())radioCancelRefresh();else radioRefresh();return true;}
    if(px>=244&&px<468){netList=true;netJump=false;netListPage=std::max(0,radioInfo().index)/4;return true;}
   }
   return true; // blank toolbar area is not a play/pause button
@@ -1110,7 +1110,7 @@ void drawPlayPage(Arduino_Canvas* c, uint32_t t, uint16_t accent, uint8_t src,
   }
 
   if(!mac&&radioEnabled()&&volK<=0.02f){
-    radioButton(c,24,408,210,langEn()?"Fetch":"获取节目");
+    radioButton(c,24,408,210,radioRefreshing()?(langEn()?"Cancel":"取消"):(langEn()?"Fetch":"获取节目"));
     radioButton(c,246,408,210,langEn()?"List":"列表");
   }
   pmVolume(c, volume, volK);

@@ -6,6 +6,8 @@ bool radioInit();
 bool radioEnabled();
 bool radioConfigure(const char* feed, bool enabled);
 void radioRefresh();
+bool radioRefreshing();
+void radioCancelRefresh();
 void radioDisable();
 void radioPoll();
 void radioToggle();

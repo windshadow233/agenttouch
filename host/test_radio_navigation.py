@@ -30,7 +30,10 @@ int radioCount(){return episodes.size();}
 struct Info {int index;};
 Info radioInfo(){return {selected};}
 void radioSelect(int i,bool){selected=i;}
-void radioRefresh(){}
+bool fetching=false;int fetches=0,cancels=0;
+bool radioRefreshing(){return fetching;}
+void radioRefresh(){fetching=true;fetches++;}
+void radioCancelRefresh(){fetching=false;cancels++;}
 const int RADIO_FOOTER_TOP=396;
 '''
         checks = r'''
@@ -58,6 +61,10 @@ int main(){
  radioPageTap(100,90);assert(selected==116&&!netList);
  episodes.clear();netList=true;netJump=true;netJumpValue=1;
  radioPageTap(390,430);assert(!netJump&&netListPage==0);
+ netList=false;
+ radioPageTap(100,430);assert(fetching&&fetches==1&&cancels==0);
+ radioPageTap(100,430);assert(!fetching&&fetches==1&&cancels==1);
+ radioPageTap(100,430);assert(fetching&&fetches==2);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
