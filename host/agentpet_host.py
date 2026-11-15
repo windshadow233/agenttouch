@@ -411,7 +411,6 @@ _host_key_at = 0.0           # last key event the host posted itself
 VOICE_MODE = "hold_fn"
 VOICE_SHORTCUT = "fn"             # editable in the web dictation settings
 _voice_pressed_shortcut = None    # latch at key-down; release this even after a settings change
-_voice_press_generation = 0       # invalidate delayed prompts on release/repress
 FN_KEYCODE = 63
 
 # Pickup page binding (doc/06 screen-sovereignty rules): what the board
@@ -1377,7 +1376,7 @@ def _post_voice_shortcut(spec, down):
     _host_key_stamp()
 
 def voice_key(start: bool):
-    global voice_down, _voice_pressed_shortcut, _voice_press_generation
+    global voice_down, _voice_pressed_shortcut
     if start:
         if _voice_pressed_shortcut is not None:
             return                           # duplicate press: do not trigger twice
@@ -1400,15 +1399,12 @@ def voice_key(start: bool):
             return
         _voice_pressed_shortcut = spec if start else None
         voice_down = bool(start)             # reverse focus follow freezes while held
-        if start:
-            _voice_press_generation += 1
         log("voice:", spec, "DOWN (hold)" if start else "UP (release)")
         return True
     except Exception as e:
         log("voice key error:", e)
     finally:
         if not start:
-            _voice_press_generation += 1
             _voice_pressed_shortcut = None
             voice_down = False
 
@@ -3235,7 +3231,7 @@ def voice_start_timed(focus, board_mic, received_at, link=""):
     focused = time.perf_counter()
     ok, mic_ms, setup = future.result() if future is not None else (True, 0, {})
     prepared = time.perf_counter()
-    shortcut_ok = voice_key(True)
+    voice_key(True)
     triggered = time.perf_counter()
     if board_mic and ok:
         mic_sink_open_gate()
@@ -3261,25 +3257,6 @@ def voice_start_timed(focus, board_mic, received_at, link=""):
     if board_mic:
         log("voice: board mic (%s) ->" % link, MIC_SINK_DEVICE if ok else "FAILED, Mac mic")
     log("voice startup:", json.dumps(timing, ensure_ascii=False))
-    if shortcut_ok:
-        threading.Thread(target=voice_ready_prompt, daemon=True).start()
-
-def voice_ready_prompt():
-    """Allow dictation 1.5 seconds to open; cancel if this press ends."""
-    generation = _voice_press_generation
-    with lock:
-        tcp_up = bool(boards)
-    if not voice_down or not tcp_up:
-        return
-    try:
-        time.sleep(1.5)
-        if not voice_down or generation != _voice_press_generation:
-            return
-        wav = tts_wav(tr("请讲", "Go ahead"))
-        if wav and voice_down and generation == _voice_press_generation:
-            speak_push(wav)
-    except Exception as exc:
-        log("voice ready prompt:", exc)
 
 
 def mic_sink_open_gate():
@@ -5698,7 +5675,6 @@ def prime_voices():
     """Pre-synthesize the fixed phrase set so runtime speech is pure cache
     (cloud quality + zero latency + works offline afterwards)."""
     try:
-        tts_wav(tr("请讲", "Go ahead"))
         if VOICE_STYLE == "tts":
             for a in AGENTS:
                 tts_wav(phrase_needs(a))
