@@ -1303,6 +1303,7 @@ static int      wifiReplyId = -1;              // a list reply owed once the sca
 static const int WIFI_NEAR_MAX = 10;
 static String   wifiNear[WIFI_NEAR_MAX];
 static int16_t  wifiNearRssi[WIFI_NEAR_MAX];
+static bool     wifiNearSecure[WIFI_NEAR_MAX];
 static int      wifiNearN = 0;
 
 // The drawer owns touch and rotation until dismissed.
@@ -1563,6 +1564,20 @@ static const char* wifiKeyRows[3][4]={
 static void wifiUiText(Arduino_Canvas* c,int x,int y,const char* text,uint16_t color) {
   almanacPrintSmall(c,x,y,text,color,0x0841);
 }
+// Prefer the current scan; saved credentials cover networks out of range.
+static bool wifiNeedsPassword(const String& ssid) {
+  for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==ssid)return wifiNearSecure[i];
+  int known=wifiKnown(ssid);
+  return known==WIFI_FACTORY?strlen(WIFI_PASS)>0:known>=0 && wifiPass[known].length()>0;
+}
+static void wifiLockIcon(Arduino_Canvas* c,int x,int y,bool secure,uint16_t color) {
+  // Open shackles have a visible gap above the right side of the body.
+  c->drawRoundRect(x+3,y,12,13,5,color);
+  if(!secure)c->fillRect(x+10,y+6,6,7,0x0841);
+  c->fillRoundRect(x,y+10,18,14,3,color);
+  c->fillCircle(x+9,y+16,2,0x0841);
+  c->drawFastVLine(x+9,y+17,4,0x0841);
+}
 static void wifiDrawerDraw(Arduino_Canvas* c) {
   const uint16_t bg=0x0841,fg=0xFFFF,muted=0x9CF3,accent=0x5EBD;
   c->fillScreen(bg);
@@ -1601,23 +1616,31 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
       }
       String ssid=row.ssid;
       c->drawRoundRect(48,y,384,68,12,0x3186);
+      bool known=wifiKnown(ssid)!=-1;
       bool canForget=wifiKnown(ssid)>=0;
-      if(!canForget||!buttonPressedIn(320,y+12,100,44))buttonPressedOutline(c,48,y,384,68,12);
-      almanacFit(fitted,sizeof(fitted),ssid.c_str(),canForget?240:344,true);
-      wifiUiText(c,66,y+27,fitted,fg);
       bool connected=WiFi.status()==WL_CONNECTED && WiFi.SSID()==ssid;
+      if(!known||!buttonPressedIn(242,y+12,182,44))buttonPressedOutline(c,48,y,384,68,12);
+      almanacFit(fitted,sizeof(fitted),ssid.c_str(),known?146:318,true);
+      wifiLockIcon(c,62,y+8,wifiNeedsPassword(ssid),muted);
+      wifiUiText(c,88,y+27,fitted,fg);
       const char* label=connected?(langEn()?"Connected":"已连接"):wifiKnown(ssid)!=-1?(langEn()?"Saved":"已记住"):(langEn()?"Nearby":"附近网络");
       int rssi=0;for(int i=0;i<wifiNearN;i++)if(wifiNear[i]==ssid)rssi=wifiNearRssi[i];
       if(!connected && wifiKnown(ssid)!=-1 && !rssi && !wifiScanning)
         label=langEn()?"Out of range":"不在范围内";
       String detail=label;if(rssi)detail+="  "+String(rssi)+" dBm";
-      almanacFit(fitted,sizeof(fitted),detail.c_str(),canForget?240:344,true);
+      almanacFit(fitted,sizeof(fitted),detail.c_str(),known?168:344,true);
       wifiUiText(c,66,y+53,fitted,connected?accent:muted);
+      if(known) {
+        const char* connectLabel=connected?(langEn()?"Connected":"已连接"):(langEn()?"Connect":"连接");
+        c->drawRoundRect(242,y+12,90,44,8,connected?0x3186:accent);
+        if(!connected&&!wifiJoining)buttonPressedOutline(c,242,y+12,90,44,8);
+        wifiUiText(c,287-almanacTextWidthSmall(connectLabel)/2,y+40,connectLabel,connected?muted:accent);
+      }
       if(canForget) {
-        c->drawRoundRect(320,y+12,100,44,10,0xB30C);
-        buttonPressedOutline(c,320,y+12,100,44,10);
+        c->drawRoundRect(334,y+12,90,44,8,0xB30C);
+        buttonPressedOutline(c,334,y+12,90,44,8);
         const char* forgetLabel=langEn()?"Forget":"忘记";
-        wifiUiText(c,370-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
+        wifiUiText(c,379-almanacTextWidthSmall(forgetLabel)/2,y+40,forgetLabel,0xFBAE);
       }
       y+=height;
     }
@@ -1677,16 +1700,18 @@ static void wifiDrawerTap(int x,int y) {
       top+=height;
     }
     if(r>=n || rows[r].kind!=WIFI_ROW_NET || y-top>=68)return;
-    if(x>=320 && x<420 && y-top>=12 && y-top<56 && wifiKnown(rows[r].ssid)>=0) {
+    if(x>=334 && x<424 && y-top>=12 && y-top<56 && wifiKnown(rows[r].ssid)>=0) {
       String sid=rows[r].ssid;const char* error=wifiForget(sid);
       wifiNotice=error?(langEn()?"Could not forget; please retry":"忘记失败，请重试"):
         (langEn()?"Network forgotten":"已忘记网络");
       return;
     }
+    bool connect=x>=242 && x<332 && y-top>=12 && y-top<56 && wifiKnown(rows[r].ssid)!=-1;
+    if(connect && WiFi.status()==WL_CONNECTED && WiFi.SSID()==rows[r].ssid)return;
     wifiTarget=rows[r].ssid;int known=wifiKnown(wifiTarget);
     wifiInput=known==WIFI_FACTORY?String(WIFI_PASS):known>=0?wifiPass[known]:String();
     wifiEditing=true;wifiShowPass=false;wifiKeyMode=0;wifiNotice="";
-    if(known!=-1)wifiDrawerJoin();
+    if(connect) {wifiEditing=false;wifiDrawerJoin();}
   } else if(y>=125&&y<169&&x>=360)wifiShowPass=!wifiShowPass;
   else if(y>=182&&y<374&&x>=40&&x<440) {
     int r=(y-182)/48,k=(x-40)/40;
@@ -2722,9 +2747,11 @@ static void wifiPoll() {
         if (at < 0 && wifiNearN < WIFI_NEAR_MAX) { at = wifiNearN++; wifiNear[at] = sid; wifiNearRssi[at] = -128; }
         if (at >= 0 && rs > wifiNearRssi[at]) {
           wifiNearRssi[at] = rs;
+          wifiNearSecure[at] = WiFi.encryptionType(k)!=WIFI_AUTH_OPEN;
           while (at > 0 && wifiNearRssi[at] > wifiNearRssi[at - 1]) {
             String ts = wifiNear[at]; wifiNear[at] = wifiNear[at - 1]; wifiNear[at - 1] = ts;
             int16_t tr = wifiNearRssi[at]; wifiNearRssi[at] = wifiNearRssi[at - 1]; wifiNearRssi[at - 1] = tr;
+            bool secure=wifiNearSecure[at];wifiNearSecure[at]=wifiNearSecure[at-1];wifiNearSecure[at-1]=secure;
             at--;
           }
         }
