@@ -579,6 +579,23 @@ int almanacPrintSmall(Arduino_Canvas* c, int x, int baseline, const char* s,
   return afPrint(c, AF_TINY, x, baseline, s, fg, bg);
 }
 int almanacTextWidthSmall(const char* s) { return afWidth(AF_TINY, s); }
+int almanacTextInkWidthSmall(const char* s) {
+  int x=0,left=1<<20,right=-(1<<20);
+  for(const char* p=s;*p;) {
+    const uint8_t* g=afGlyph(AF_TINY,afDecode(p));
+    if(!g){x+=19;continue;}
+    if(g[0] && g[1]) {
+      left=min(left,x+(int8_t)g[3]);
+      right=max(right,x+(int8_t)g[3]+g[0]);
+    }
+    x+=g[2];
+  }
+  return right<left?0:right-left;
+}
+void almanacPrintSmallCenter(Arduino_Canvas* c,int cx,int cy,const char* s,
+                             uint16_t fg,uint16_t bg) {
+  afPrintCenter(c,AF_TINY,cx,cy,s,fg,bg);
+}
 
 static const uint16_t PM_TRACK = C565(0x22, 0x26, 0x2E);   // slider groove
 static const uint16_t PM_PLACE = C565(0x1A, 0x1F, 0x2A);   // artwork placeholder

@@ -1578,15 +1578,56 @@ static void wifiLockIcon(Arduino_Canvas* c,int x,int y,bool secure,uint16_t colo
   c->fillCircle(x+9,y+16,2,0x0841);
   c->drawFastVLine(x+9,y+17,4,0x0841);
 }
+// Shared header bounds keep drawing and touch targets aligned.
+static constexpr int WIFI_HEADER_Y=20, WIFI_HEADER_H=40;
+static constexpr int WIFI_BATTERY_X=364, WIFI_HEADER_GAP=20, WIFI_HEADER_PAD=8;
+struct WifiHeaderLayout {
+  const char* scan;
+  const char* close;
+  int scanX,scanW,closeX,closeW;
+};
+static WifiHeaderLayout wifiHeaderLayout() {
+  const char* scan=wifiEditing?(langEn()?"Back":"返回"):(langEn()?"Scan":"扫描");
+  const char* close=langEn()?"Close":"关闭";
+  int sw=almanacTextInkWidthSmall(scan),cw=almanacTextInkWidthSmall(close);
+  int closeLeft=WIFI_BATTERY_X-WIFI_HEADER_GAP-cw;
+  int scanLeft=closeLeft-WIFI_HEADER_GAP-sw;
+  return {scan,close,scanLeft-WIFI_HEADER_PAD,sw+2*WIFI_HEADER_PAD,
+          closeLeft-WIFI_HEADER_PAD,cw+2*WIFI_HEADER_PAD};
+}
+static void wifiHeaderLabel(Arduino_Canvas* c,int x,int width,const char* text,uint16_t color) {
+  almanacPrintSmallCenter(c,x+width/2,WIFI_HEADER_Y+WIFI_HEADER_H/2,text,color,0x0841);
+}
+static void wifiDrawerBattery(Arduino_Canvas* c) {
+  static int pct=-1;
+  static bool charging=false, sampled=false;
+  static uint32_t sampledAt=0;
+  uint32_t now=millis();
+  if(!sampled || (int32_t)(now-sampledAt)>=2000) {
+    sampled=true;sampledAt=now;
+    pct=pmuOk && pmu.isBatteryConnect()?pmu.getBatteryPercent():-1;
+    charging=pmuOk && pmu.isCharging();
+  }
+  uint16_t color=charging?0x5EBD:pct>=0 && pct<=20?0xFBAE:0x9CF3;
+  c->drawRoundRect(WIFI_BATTERY_X,32,25,16,3,color);
+  c->fillRect(389,37,3,6,color);
+  if(pct>=0)c->fillRect(367,35,19*min(pct,100)/100,10,color);
+  char text[8];
+  if(pct>=0)snprintf(text,sizeof(text),"%d%%",pct);
+  else strlcpy(text,"--",sizeof(text));
+  wifiUiText(c,398,47,text,color);
+}
 static void wifiDrawerDraw(Arduino_Canvas* c) {
   const uint16_t bg=0x0841,fg=0xFFFF,muted=0x9CF3,accent=0x5EBD;
   c->fillScreen(bg);
   c->fillRoundRect(210,468,60,5,2,muted);
   wifiUiText(c,58,48,"Wi-Fi",fg);
-  wifiUiText(c,300,48,wifiEditing?(langEn()?"Back":"返回"):(langEn()?"Scan":"扫描"),accent);
-  wifiUiText(c,398,48,langEn()?"Close":"关闭",muted);
-  if(!wifiJoining)buttonPressedOutline(c,290,20,92,40,10);
-  buttonPressedOutline(c,390,20,78,40,10);
+  const auto header=wifiHeaderLayout();
+  wifiHeaderLabel(c,header.scanX,header.scanW,header.scan,accent);
+  wifiHeaderLabel(c,header.closeX,header.closeW,header.close,muted);
+  if(!wifiJoining)buttonPressedOutline(c,header.scanX,WIFI_HEADER_Y,header.scanW,WIFI_HEADER_H,10);
+  buttonPressedOutline(c,header.closeX,WIFI_HEADER_Y,header.closeW,WIFI_HEADER_H,10);
+  wifiDrawerBattery(c);
   String status=wifiNotice;
   if(wifiJoining) status=langEn()?"Connecting...":"正在连接…";
   else if(wifiScanning) status=langEn()?"Scanning...":"正在扫描…";
@@ -1677,9 +1718,11 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   wifiUiText(c,240-almanacTextWidthSmall(connectLabel)/2,450,connectLabel,fg);
 }
 static void wifiDrawerTap(int x,int y) {
-  if(y<60) {
-    if(x>=390){wifiDrawer=false;if(!wifiJoining)wifiInput="";}
-    else if(x>=290 && !wifiJoining) {
+  if(y<WIFI_HEADER_Y+WIFI_HEADER_H) {
+    if(y<WIFI_HEADER_Y)return;
+    const auto header=wifiHeaderLayout();
+    if(x>=header.closeX && x<header.closeX+header.closeW){wifiDrawer=false;if(!wifiJoining)wifiInput="";}
+    else if(x>=header.scanX && x<header.scanX+header.scanW && !wifiJoining) {
       if(wifiEditing){wifiEditing=false;wifiInput="";wifiNotice="";}
       else {wifiNotice="";wifiStartScan();}
     }

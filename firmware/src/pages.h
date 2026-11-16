@@ -67,7 +67,11 @@ void almanacFit(char* out, size_t n, const char* s, int maxW, bool small);   // 
 bool almanacHasAll(const char* s);        // every glyph drawable (flash or card)
 int almanacPrintSmall(Arduino_Canvas* c, int x, int baseline, const char* s,
                       uint16_t fg, uint16_t bg);
+// Center the visible glyph bounds on the supplied point.
+void almanacPrintSmallCenter(Arduino_Canvas* c,int cx,int cy,const char* s,
+                             uint16_t fg,uint16_t bg);
 int almanacTextWidthSmall(const char* s);
+int almanacTextInkWidthSmall(const char* s);
 // tiny18 with letter tracking, on black (Claude 多会话 top row)
 int almanacPrintSmallTrack(Arduino_Canvas* c, int x, int baseline, const char* s,
                            uint16_t fg, int track);
