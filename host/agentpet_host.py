@@ -1327,6 +1327,98 @@ def claude_decision(kind, spec, sid8):
     return True
 
 # ------------------------------------------------------------------ voice key
+_dictation_lock = threading.Lock()
+_dictation = {"listening": None, "observer": False, "request": 0,
+              "held": False, "pending_until": 0.0}
+DICTATION_START = "DictationIMNotificationStartedListening"
+DICTATION_STOP = "DictationIMNotificationStoppedListening"
+DICTATION_EXIT = "DictationIMNotificationDidExitDictationMode"
+
+def voice_ready_request(start):
+    """Scope the ready prompt to a board press, including queued preparation."""
+    with _dictation_lock:
+        _dictation["request"] += 1
+        _dictation["held"] = bool(start)
+        _dictation["pending_until"] = 0.0
+        return _dictation["request"]
+
+def voice_ready_arm(request):
+    with _dictation_lock:
+        if request == _dictation["request"] and _dictation["held"]:
+            _dictation["pending_until"] = time.monotonic() + 8.0
+
+def voice_ready_cancel(request):
+    with _dictation_lock:
+        if request == _dictation["request"]:
+            _dictation["pending_until"] = 0.0
+
+def _voice_ready_speak(request):
+    try:
+        wav = tts_wav("主人，请讲", TTS_VOICES["zh"])
+        # Synthesis can finish after release or a later press. Never announce
+        # readiness for a session that has already ended.
+        with _dictation_lock:
+            current = (request == _dictation["request"] and
+                       _dictation["held"] and _dictation["listening"] is True)
+        with lock:
+            tcp_up = bool(boards)
+        if wav and current and tcp_up:
+            speak_push(wav)
+    except Exception as exc:
+        log("voice ready prompt error:", exc)
+
+def dictation_notification(name):
+    request = None
+    with _dictation_lock:
+        if name == DICTATION_START:
+            _dictation["listening"] = True
+            if (_dictation["held"] and
+                    time.monotonic() < _dictation["pending_until"]):
+                request = _dictation["request"]
+            _dictation["pending_until"] = 0.0  # consume before dispatch: duplicates are silent
+        elif name in (DICTATION_STOP, DICTATION_EXIT):
+            _dictation["listening"] = False
+        else:
+            return
+    log("dictation:", name)
+    if request is not None:
+        threading.Thread(target=_voice_ready_speak, args=(request,), daemon=True).start()
+
+def dictation_thread():
+    """Private macOS distributed notifications, verified on macOS 27.0.
+
+    Subscribe by name; wildcard observation did not deliver these events.
+    Must run on the main thread: macOS delivers distributed notifications
+    there even when observers were registered from a background thread.
+    """
+    observers = []
+    center = None
+    try:
+        from Foundation import NSDate, NSDistributedNotificationCenter, NSRunLoop
+        with objc_pool():
+            center = NSDistributedNotificationCenter.defaultCenter()
+            for name in (DICTATION_START, DICTATION_STOP, DICTATION_EXIT):
+                observers.append(center.addObserverForName_object_queue_usingBlock_(
+                    name, None, None, lambda note: dictation_notification(str(note.name()))))
+            run_loop = NSRunLoop.currentRunLoop()
+        with _dictation_lock:
+            _dictation["observer"] = True
+        log("dictation: notification observer ready")
+        while True:
+            with objc_pool():
+                run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(1.0))
+    except Exception as exc:
+        log("dictation observer unavailable:", exc)
+    finally:
+        with _dictation_lock:
+            _dictation["observer"] = False
+            _dictation["listening"] = None
+            _dictation["pending_until"] = 0.0
+        if center is not None:
+            with objc_pool():
+                for observer in observers:
+                    center.removeObserver_(observer)
+
 try:
     import Quartz
     _HAVE_QUARTZ = True
@@ -3211,7 +3303,7 @@ def _prepare_voice_mic():
         setup = dict(_mic_setup_timing)
     return ok, elapsed, setup
 
-def voice_start_timed(focus, board_mic, received_at, link=""):
+def voice_start_timed(focus, board_mic, received_at, link="", prompt_request=None):
     """Overlap mic preparation with focus; join both before dispatching keys."""
     began = time.perf_counter()
     future = _voice_prepare_pool.submit(_prepare_voice_mic) if board_mic else None
@@ -3231,7 +3323,15 @@ def voice_start_timed(focus, board_mic, received_at, link=""):
     focused = time.perf_counter()
     ok, mic_ms, setup = future.result() if future is not None else (True, 0, {})
     prepared = time.perf_counter()
-    voice_key(True)
+    if prompt_request is not None:
+        voice_ready_arm(prompt_request)  # before posting: the notification may arrive immediately
+    try:
+        if not voice_key(True) and prompt_request is not None:
+            voice_ready_cancel(prompt_request)
+    except Exception:
+        if prompt_request is not None:
+            voice_ready_cancel(prompt_request)
+        raise
     triggered = time.perf_counter()
     if board_mic and ok:
         mic_sink_open_gate()
@@ -3606,6 +3706,7 @@ def handle_board_msg(raw, reply):
         focus_agent(active_agent)
     elif t == "voice":
         start = m.get("a") == "start"
+        prompt_request = voice_ready_request(start)
         agent = m.get("agent") or active_agent
         if start:
             received_at = time.perf_counter()
@@ -3633,7 +3734,8 @@ def handle_board_msg(raw, reply):
                     raise_agent_app(agent, wait=0.15, focus_input=True)
 
             # Prepare mic and focus concurrently; dispatch the shortcut only after both finish.
-            inject(lambda: voice_start_timed(focus, board_mic, received_at, m.get("link", "")))
+            inject(lambda: voice_start_timed(focus, board_mic, received_at,
+                                           m.get("link", ""), prompt_request))
         else:
             with _mic_lock:
                 board_mic = _mic["session_board"]
@@ -5675,6 +5777,7 @@ def prime_voices():
     """Pre-synthesize the fixed phrase set so runtime speech is pure cache
     (cloud quality + zero latency + works offline afterwards)."""
     try:
+        tts_wav("主人，请讲", TTS_VOICES["zh"])
         if VOICE_STYLE == "tts":
             for a in AGENTS:
                 tts_wav(phrase_needs(a))
@@ -8241,8 +8344,11 @@ def save_settings(patch):
 def state_snapshot():
     """The /state JSON as a dict. Takes `lock`: the agent tables are shared with
     the watcher. product/host_version identify this host."""
+    with _dictation_lock:
+        dictation = {k: _dictation[k] for k in ("listening", "observer")}
     with lock:
         return {"product": PRODUCT, "host_version": HOST_VERSION, "lang": LANG,
+                "dictation": dictation,
                 "agents": dict(state), "active": active_agent,
                 "claude_sessions": len(claude_sessions),
                 "boards": len(boards), "ble": _ble_client is not None,
@@ -9077,7 +9183,12 @@ def main():
 
     srv = TCP(("0.0.0.0", TCP_PORT), BoardHandler)
     log(f"board TCP on 0.0.0.0:{TCP_PORT}")
-    srv.serve_forever()
+    # Keep the main Cocoa run loop available for distributed notifications.
+    # Socket handling belongs on a worker, just like the HTTP server above.
+    tcp_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    tcp_thread.start()
+    dictation_thread()
+    tcp_thread.join()                 # still serve TCP if Foundation is unavailable
 
 if __name__ == "__main__":
     main()

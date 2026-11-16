@@ -1310,6 +1310,8 @@ static bool wifiDrawer = false, wifiEditing = false, wifiJoining = false;
 static bool wifiShowPass = false;
 static uint8_t wifiKeyMode = 0, wifiDrawerRot = 0;
 static int wifiListOffset = 0;
+static bool wifiOtherTab = false;    // first tab: saved/current; second: other scan results
+static constexpr int WIFI_LIST_TOP = 142, WIFI_LIST_BOTTOM = 400;
 static String wifiTarget, wifiInput, wifiNotice;
 static uint32_t wifiJoinAt = 0;
 
@@ -1496,36 +1498,38 @@ static void wifiHandle(JsonDocument& d) {
   }
 }
 
-// Wi-Fi drawer: a merged saved/nearby list and an ASCII password keyboard.
+// Wi-Fi drawer: saved/other network tabs and an ASCII password keyboard.
 static int wifiKnown(const String& ssid) {
   for (int i=0;i<wifiN;i++) if (wifiSsid[i]==ssid) return i;
   return kFactoryWifi && ssid==WIFI_SSID ? WIFI_FACTORY : -1;
 }
-enum WifiRowKind : uint8_t { WIFI_ROW_NET, WIFI_ROW_MINE, WIFI_ROW_OTHER, WIFI_ROW_EMPTY, WIFI_ROW_SCAN };
+enum WifiRowKind : uint8_t { WIFI_ROW_NET, WIFI_ROW_EMPTY, WIFI_ROW_SCAN };
 struct WifiListRow { String ssid; WifiRowKind kind; };
 static int wifiRowHeight(const WifiListRow& row) {
-  return row.kind==WIFI_ROW_NET?75:(row.kind==WIFI_ROW_MINE || row.kind==WIFI_ROW_OTHER)?28:40;
+  return row.kind==WIFI_ROW_NET?75:40;
 }
 static int wifiRows(std::vector<WifiListRow>& rows) {
-  rows.clear();rows.push_back({"",WIFI_ROW_MINE});
+  rows.clear();
   auto addNetwork=[&](const String& sid) {
     for(const auto& row:rows)if(row.kind==WIFI_ROW_NET && row.ssid==sid)return;
     rows.push_back({sid,WIFI_ROW_NET});
   };
-  if(WiFi.status()==WL_CONNECTED)addNetwork(WiFi.SSID());
-  for(const String& sid:wifiSsid)addNetwork(sid);
-  if(kFactoryWifi)addNetwork(WIFI_SSID);
-  if(rows.size()==1)rows.push_back({"",WIFI_ROW_EMPTY});
-  rows.push_back({"",WIFI_ROW_OTHER});
-  size_t others=rows.size();
-  if(!wifiScanning)for(int i=0;i<wifiNearN;i++)addNetwork(wifiNear[i]);
-  if(rows.size()==others)rows.push_back({"",wifiScanning?WIFI_ROW_SCAN:WIFI_ROW_EMPTY});
+  if(!wifiOtherTab) {
+    if(WiFi.status()==WL_CONNECTED)addNetwork(WiFi.SSID());
+    for(const String& sid:wifiSsid)addNetwork(sid);
+    if(kFactoryWifi)addNetwork(WIFI_SSID);
+  } else if(!wifiScanning) {
+    for(int i=0;i<wifiNearN;i++)
+      if(wifiKnown(wifiNear[i])==-1 &&
+         !(WiFi.status()==WL_CONNECTED && WiFi.SSID()==wifiNear[i]))addNetwork(wifiNear[i]);
+  }
+  if(rows.empty())rows.push_back({"",wifiOtherTab && wifiScanning?WIFI_ROW_SCAN:WIFI_ROW_EMPTY});
   return rows.size();
 }
 static void wifiClampList(const std::vector<WifiListRow>& rows) {
   // Clamp to the first row of the last viewport after scan/forget changes.
   int top=(int)rows.size(),height=0;
-  while(top>0 && height+wifiRowHeight(rows[top-1])<=300)height+=wifiRowHeight(rows[--top]);
+  while(top>0 && height+wifiRowHeight(rows[top-1])<=WIFI_LIST_BOTTOM-WIFI_LIST_TOP)height+=wifiRowHeight(rows[--top]);
   wifiListOffset=max(0,min(wifiListOffset,top));
 }
 static void wifiDrawerJoin() {
@@ -1543,6 +1547,7 @@ static void wifiDrawerPoll() {
   if(WiFi.status()==WL_CONNECTED && WiFi.SSID()==wifiTarget) {
     bool saved=wifiKnown(wifiTarget)==WIFI_FACTORY || wifiRemember(wifiTarget,wifiInput);
     wifiJoining=false;wifiEditing=false;wifiInput="";
+    wifiOtherTab=false;wifiListOffset=0;
     wifiNotice=saved?(langEn()?"Connected":"已连接"):
       (langEn()?"Connected; could not save":"已连接，存储写入失败，未保存");
   } else if((int32_t)(millis()-wifiJoinAt)>20000) {
@@ -1574,18 +1579,24 @@ static void wifiDrawerDraw(Arduino_Canvas* c) {
   char fitted[128];almanacFit(fitted,sizeof(fitted),status.c_str(),364,true);
   wifiUiText(c,58,79,fitted,muted);
   if(!wifiEditing) {
+    c->fillRoundRect(48,96,384,38,10,0x18E3);
+    c->fillRoundRect(wifiOtherTab?240:48,96,192,38,10,0x3186);
+    const char* tabs[]={langEn()?"My Networks":"我的网络",langEn()?"Other Networks":"其他网络"};
+    for(int i=0;i<2;i++) {
+      buttonPressedOutline(c,48+i*192,96,192,38,10);
+      wifiUiText(c,144+i*192-almanacTextWidthSmall(tabs[i])/2,122,tabs[i],
+                 wifiOtherTab==(i==1)?fg:muted);
+    }
     std::vector<WifiListRow> rows;int n=wifiRows(rows);
     wifiClampList(rows);
-    int y=100;
+    int y=WIFI_LIST_TOP;
     for(int r=wifiListOffset;r<n;r++) {
       const auto& row=rows[r];int height=wifiRowHeight(row);
-      if(y+height>400)break;
+      if(y+height>WIFI_LIST_BOTTOM)break;
       if(row.kind!=WIFI_ROW_NET) {
-        const char* label=row.kind==WIFI_ROW_MINE?(langEn()?"My Networks":"我的网络"):
-          row.kind==WIFI_ROW_OTHER?(langEn()?"Other Networks":"其他网络"):
-          row.kind==WIFI_ROW_SCAN?(langEn()?"Scanning...":"正在扫描…"):
+        const char* label=row.kind==WIFI_ROW_SCAN?(langEn()?"Scanning...":"正在扫描…"):
           (langEn()?"None":"暂无网络");
-        wifiUiText(c,58,y+20,label,row.kind==WIFI_ROW_MINE || row.kind==WIFI_ROW_OTHER?accent:muted);
+        wifiUiText(c,58,y+20,label,muted);
         y+=height;continue;
       }
       String ssid=row.ssid;
@@ -1653,12 +1664,15 @@ static void wifiDrawerTap(int x,int y) {
   }
   if(wifiJoining)return;
   if(!wifiEditing) {
-    if(x<48||x>=432||y<100||y>=400)return;
+    if(y>=96 && y<134 && x>=48 && x<432) {
+      wifiOtherTab=x>=240;wifiListOffset=0;return;
+    }
+    if(x<48||x>=432||y<WIFI_LIST_TOP||y>=WIFI_LIST_BOTTOM)return;
     std::vector<WifiListRow> rows;int n=wifiRows(rows);
-    wifiClampList(rows);int top=100,r=wifiListOffset;
+    wifiClampList(rows);int top=WIFI_LIST_TOP,r=wifiListOffset;
     for(;r<n;r++) {
       int height=wifiRowHeight(rows[r]);
-      if(top+height>400)return;
+      if(top+height>WIFI_LIST_BOTTOM)return;
       if(y<top+height)break;
       top+=height;
     }
@@ -3268,11 +3282,11 @@ static void touchPoll() {
     if(!claimShowing() && !listening && (wifiDrawer || (sy<48 && ey-sy>60 && abs(ex-sx)*2<ey-sy))) {
       pendH=pendV=0;tpConsumed=false;lastTapAt=0;
       if(!wifiDrawer) {
-        wifiDrawer=true;wifiDrawerRot=shownRot;wifiEditing=false;wifiListOffset=0;
+        wifiDrawer=true;wifiDrawerRot=shownRot;wifiEditing=false;wifiListOffset=0;wifiOtherTab=false;
         wifiNotice="";setCardUntil=profUntil=0;wifiStartScan();
       } else if(abs(ey-sy)>50 && abs(ey-sy)>abs(ex-sx)*2) {
         if(sy>=400 && ey<sy) {wifiDrawer=false;if(!wifiJoining)wifiInput="";}
-        else if(!wifiEditing && sy>=100 && sy<400)
+        else if(!wifiEditing && sy>=WIFI_LIST_TOP && sy<WIFI_LIST_BOTTOM)
           wifiListOffset=max(0,wifiListOffset+(ey<sy?2:-2));
       } else if(abs(ex-sx)<20 && abs(ey-sy)<20) wifiDrawerTap(ex,ey);
       tpWasDown=false;noteActivity();return;

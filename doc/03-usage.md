@@ -62,6 +62,7 @@ Hold the right key and talk. Release, and a **Send** bubble appears for 6 s; tap
 - On the face page, your words go to the current seat's app. On any other page, they go wherever the Mac's cursor is.
 - The Mac side holds the fn key for you, so you need an input method that dictates while fn is held (the author uses WeChat Input).
 - By default the Mac's microphone listens. To talk into the board's microphone instead, choose it under **Dictation → Microphone** in the settings page (needs the BlackHole virtual audio driver).
+- When the right key starts macOS Dictation, the board says “主人，请讲” (“Please speak, master”) after the system confirms it is listening (requires Wi-Fi). No prompt plays without confirmation, after release, or if confirmation takes more than 8 seconds. Third-party input methods may not emit this system notification.
 
 ## On its side
 
