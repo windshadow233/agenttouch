@@ -29,6 +29,7 @@ import threading
 import time
 import tracemalloc
 import unittest
+from unittest.mock import patch
 import wave
 import zlib
 from unittest import mock
@@ -1355,7 +1356,8 @@ class AudioLibraryTests(unittest.TestCase):
     def test_rm_deletes_both_files_and_forgets_the_push(self):
         self._episode("20260826-aaaaaaaa")
         H.au_pushed()["20260826-aaaaaaaa"] = {"at": 1}
-        r = H.au_rm("20260826-aaaaaaaa.ima")                       # extension tolerated
+        with patch.object(H, "au_has_tcp", return_value=True), patch.object(H, "push_board"), patch.object(H, "wait_reply", return_value={"ok": True}):
+            r = H.au_rm("20260826-aaaaaaaa.ima")  # extension tolerated
         self.assertTrue(r["ok"])
         self.assertEqual(sorted(r["local"]), ["20260826-aaaaaaaa.ima",
                                               "20260826-aaaaaaaa.json"])
@@ -1369,10 +1371,43 @@ class AudioLibraryTests(unittest.TestCase):
             self.assertFalse(r["ok"], bad)
             self.assertIn("bad id", r["why"], bad)
 
-    def test_rm_says_no_when_there_was_nothing_to_delete(self):
-        r = H.au_rm("20260826-aaaaaaaa")            # well-formed, simply not here
-        self.assertFalse(r["ok"])
-        self.assertIn("no such episode", r["why"])
+    def test_rm_is_idempotent_when_board_confirms_missing_episode(self):
+        with patch.object(H, "au_has_tcp", return_value=True), patch.object(H, "push_board"), patch.object(H, "wait_reply", return_value={"ok": True}):
+            self.assertTrue(H.au_rm("20260826-aaaaaaaa")["ok"])
+
+    def test_rm_keeps_local_files_when_board_fails(self):
+        self._episode("20260826-aaaaaaaa")
+        with patch.object(H, "au_has_tcp", return_value=True), patch.object(H, "push_board"), patch.object(H, "wait_reply", return_value={"ok": False}):
+            self.assertFalse(H.au_rm("20260826-aaaaaaaa")["ok"])
+        self.assertEqual(H.au_names(), ["20260826-aaaaaaaa"])
+
+    def test_board_delete_sync_replays_and_acks(self):
+        self._episode("20260826-aaaaaaaa")
+        replies = []
+        event = {"name": "20260826-aaaaaaaa", "token": 7}
+        H.au_sync_delete(event, replies.append)
+        H.au_sync_delete(event, replies.append)
+        self.assertEqual(H.au_names(), [])
+        self.assertEqual(len(replies), 2)
+        self.assertEqual(json.loads(replies[0]), {"t": "pdel_ack", "name": event["name"], "token": 7})
+
+    def test_rm_offline_keeps_local_files(self):
+        self._episode("20260826-aaaaaaaa")
+        with patch.object(H, "au_has_tcp", return_value=False), patch.object(H, "_ble_client", None):
+            self.assertFalse(H.au_rm("20260826-aaaaaaaa")["ok"])
+        self.assertEqual(H.au_names(), ["20260826-aaaaaaaa"])
+
+    def test_sync_does_not_ack_local_delete_failure(self):
+        replies = []
+        with patch.object(H, "au_delete_local", side_effect=OSError("disk error")):
+            H.au_sync_delete({"name": "20260826-aaaaaaaa", "token": 7}, replies.append)
+        self.assertEqual(replies, [])
+
+    def test_rm_uses_bluetooth_without_wifi(self):
+        self._episode("20260826-aaaaaaaa")
+        with patch.object(H, "au_has_tcp", return_value=False), patch.object(H, "_ble_client", object()), patch.object(H, "push_board") as send, patch.object(H, "wait_reply", return_value={"ok": True}):
+            self.assertTrue(H.au_rm("20260826-aaaaaaaa")["ok"])
+            self.assertEqual(send.call_args.args[0]["t"], "pdel")
 
     def test_add_validates_before_it_queues(self):
         seen, old = [], H.au_enqueue

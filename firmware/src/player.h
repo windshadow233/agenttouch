@@ -14,6 +14,7 @@
 // marked "audio task" — those are the streaming side and touch the open File.
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 struct PlayerInfo {
   bool     hasItems;    // the card holds at least one playable episode
@@ -38,6 +39,13 @@ bool playerRunning(); // audio task currently pulling PCM
 const PlayerInfo& playerInfo();
 
 // Wave 2 additions.
+bool playerEpisode(int index, char* title, size_t size, unsigned* duration=nullptr);
+bool playerSelect(int index);
+bool playerDelete(int index);
+bool playerDeleteName(const char* name);
+bool playerDeletePending(const char* name);
+bool playerPendingDelete(char* name,size_t size,uint32_t* token);
+void playerDeleteAck(const char* name,uint32_t token);
 int  playerCount();         // episodes on the card ({"t":"plst"} n)
 void playerSaveState();     // write /agentpet/audio/state.json now
 void playerPoll();          // from loop(): metadata refresh, auto-advance, 10 s resume writes

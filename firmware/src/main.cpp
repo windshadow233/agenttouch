@@ -2060,6 +2060,11 @@ static void handleLine(const String& line) {
           d["pos"] | 0.0f, d["dur"] | 0.0f, (d["play"] | 0) != 0,
           d["rate"] | 1.0f, d["app"] | "", cover);
     if (on) npCoverCheck(cover);
+  } else if (strcmp(t,"pdel")==0) {
+    JsonDocument reply;reply["t"]="pdel";reply["id"]=d["id"] | 0;
+    reply["ok"]=playerDeleteName(d["name"] | "");sendJson(reply);
+  } else if (strcmp(t,"pdel_ack")==0) {
+    playerDeleteAck(d["name"] | "",d["token"] | 0u);
   } else if (strcmp(t, "pl") == 0) {        // host: /agentpet/audio/ changed
     playerRescan();
   } else if (strcmp(t, "netradio") == 0) {
@@ -2070,12 +2075,24 @@ static void handleLine(const String& line) {
       ok = radioConfigure(d["feed"] | "", d["enabled"] | false);
     } else if (!strcmp(op,"disable")) radioDisable();
     else if (!strcmp(op,"refresh")) radioRefresh();
+    else if (!strcmp(op,"import")) radioImport();
     else if (!strcmp(op,"cancel")) radioCancelRefresh();
     else if (!strcmp(op,"select")) radioSelect(d["index"] | 0,true);
     else if (!strcmp(op,"pause")) radioPause();
-    else if (strcmp(op,"status")) ok=false;
+    else if (strcmp(op,"status") && strcmp(op,"list")) ok=false;
     JsonDocument r;r["t"]="netradio";r["id"]=d["id"] | 0;r["ok"]=ok;
     radioStatus(r.as<JsonObject>());
+    if (!strcmp(op,"list")) {
+      int count=radioCount(),page=d["page"] | 0;
+      page=constrain(page,0,count>0?(count-1)/10:0);
+      r["page"]=page;
+      JsonArray list=r["episodes"].to<JsonArray>();
+      for(int i=page*10;i<count && i<page*10+10;++i){
+        char title[256];unsigned duration=0;
+        if(!radioEpisode(i,title,sizeof(title),&duration))break;
+        JsonObject ep=list.add<JsonObject>();ep["index"]=i;ep["title"]=title;ep["duration"]=duration;
+      }
+    }
     sendJson(r);
   } else if (strcmp(t, "play") == 0) {      // host debug (/test/play/<cmd>[&src=mac]): drive a page
     // Same helpers the tap zones run. Default target is the board player;
@@ -2201,6 +2218,12 @@ static void handleLine(const String& line) {
   } else if (strcmp(t, "fbeg") == 0) {      // file push: open <path>.part
     int id = d["id"] | 0;
     const char* path = d["path"] | "";
+    if(!strncmp(path,"/agentpet/audio/",16)){
+      char name[48];snprintf(name,sizeof(name),"%s",path+16);char* dot=strrchr(name,'.');
+      if(dot&&(!strcmp(dot,".ima")||!strcmp(dot,".json"))){*dot=0;
+        if(playerDeletePending(name)){xfReply(id,false,"episode deletion awaiting host sync");return;}
+      }
+    }
     // A transfer already running owns the card (the host serialises pushes;
     // this is the board-side backstop). Only a transfer that has gone silent
     // for 10 s is dead rather than busy.
@@ -3190,7 +3213,7 @@ static void podcastHoldPoll(int x, int y) {
   int px, py;
   pageXY(x, y, px, py);
   if (shownPage != PAGE_CLOCK || clockView != CV_POD || claimShowing() ||
-      listening || demoStart || (radioEnabled()&&py>=RADIO_FOOTER_TOP) ||
+      listening || demoStart || (py>=RADIO_FOOTER_TOP) ||
       playZoneAt(px, py) != tpPodHoldZone ||
       abs(x - tpStartX) >= 24 || abs(y - tpStartY) >= 24) {
     tpPodHoldZone = 0;                  // leaving the button/dragging cancels this hold
@@ -3251,7 +3274,7 @@ static void touchPoll() {
         tpPodSeeking = playSeekBegin(px, py);
         tpPodSeekRot = shownRot;
         if(tpPodSeeking)pendH=pendV=0;
-        else if(!(radioEnabled()&&py>=RADIO_FOOTER_TOP))tpPodHoldZone = playZoneAt(px, py);
+        else if(!(py>=RADIO_FOOTER_TOP))tpPodHoldZone = playZoneAt(px, py);
       }
       noteActivity();
     }
@@ -3526,7 +3549,7 @@ static void touchPoll() {
         int startX,startY;
         pageXY(tpStartX,tpStartY,startX,startY);
         // A tap that starts in the RSS footer cannot drift into transport.
-        bool leftFooter=pageSrc()==PSRC_SD&&radioEnabled()&&
+        bool leftFooter=pageSrc()==PSRC_SD&&
                         !radioListVisible()&&startY>=RADIO_FOOTER_TOP&&py<RADIO_FOOTER_TOP;
         if(pageSrc()==PSRC_MAC) {
           int zone=macPlayZoneAt(px,py);
@@ -3866,6 +3889,11 @@ void loop() {
   if (bPwr.down && (int32_t)(now - bPwr.at) >= 3000 && pmuOk)
     powerOff("BYE BYE...");
 
+  static uint32_t deleteSyncAt=0;
+  if((bleConnected()||sock.connected())&&millis()-deleteSyncAt>=3000){
+    deleteSyncAt=millis();char name[48];uint32_t token;
+    if(playerPendingDelete(name,sizeof(name),&token)){JsonDocument event;event["t"]="pdel_event";event["name"]=name;event["token"]=token;sendJson(event);}
+  }
   playerPoll();     // metadata after an auto-advance + the 10 s resume write
   imuPoll();
   touchPoll();

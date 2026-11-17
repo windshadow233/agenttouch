@@ -8,6 +8,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <string.h>
+#include <algorithm>
+#include <Preferences.h>
 
 static const char* PL_DIR   = "/agentpet/audio";
 static const char* PL_STATE = "/agentpet/audio/state.json";
@@ -240,6 +242,93 @@ void playerRescan() {
   gInfo.hasItems = s_n > 0;
   plLoadMeta();
   Serial.printf("player: rescan -> %d episode(s)%s\n", s_n, was && i >= 0 ? ", still playing" : "");
+}
+
+bool playerEpisode(int index,char* title,size_t size,unsigned* duration) {
+  if(radioEnabled())return radioEpisode(index,title,size,duration);
+  if(!title||!size||index<0||index>=s_n)return false;
+  utf8Trunc(title,size,s_items[index].name);if(duration)*duration=0;
+  auto fs=sdFs();if(!fs)return true;
+  char path[128];plPath(path,sizeof(path),s_items[index].name,".json");
+  File file=fs->open(path,FILE_READ);
+  if(file){JsonDocument doc;if(!deserializeJson(doc,file)){
+    const char* text=doc["title"] | "";if(text[0])utf8Trunc(title,size,text);
+    if(duration)*duration=doc["dur"] | 0u;
+  }file.close();}return true;
+}
+
+bool playerSelect(int index) {
+  if(radioEnabled()||index<0||index>=s_n)return false;
+  bool was=plSuspend();if(s_running){s_want=was;return false;}
+  s_cur=index;s_blk=0;++s_seekGen;plLoadMeta();playerSaveState();
+  s_want=true;audioPlayerKick();return true;
+}
+
+// Persist delete intents before touching files; replay until the host acks.
+static Preferences deletePrefs;
+static JsonDocument deleteJournal;
+static bool deleteJournalReady=false;
+static bool deleteLoad(){
+ if(deleteJournalReady)return true;
+ if(!deletePrefs.begin("pod-deletes",false))return false;
+ String saved=deletePrefs.getString("pending","[]");
+ if(deserializeJson(deleteJournal,saved)||!deleteJournal.is<JsonArray>())return false;
+ deleteJournalReady=true;return true;
+}
+static bool deleteStore(){String encoded;serializeJson(deleteJournal,encoded);return deletePrefs.putString("pending",encoded)>0;}
+static bool deleteRecord(const char* name){
+ if(!deleteLoad())return false;
+ for(JsonObject item:deleteJournal.as<JsonArray>())if(!strcmp(item["name"] | "",name))return true;
+ if(deleteJournal.size()>=64)return false;
+ JsonObject item=deleteJournal.as<JsonArray>().add<JsonObject>();item["name"]=name;item["token"]=esp_random();
+ if(deleteStore())return true;
+ deleteJournal.as<JsonArray>().remove(deleteJournal.size()-1);return false;
+}
+bool playerDeletePending(const char* name){
+ if(!deleteLoad())return true; // storage failure must not overwrite an intent
+ for(JsonObject item:deleteJournal.as<JsonArray>())if(!strcmp(item["name"] | "",name))return true;
+ return false;
+}
+void playerDeleteAck(const char* name,uint32_t token){
+ if(!deleteLoad())return;
+ JsonArray items=deleteJournal.as<JsonArray>();
+ for(size_t i=0;i<items.size();++i)if(!strcmp(items[i]["name"] | "",name)&&(items[i]["token"] | 0u)==token){
+  String backup;serializeJson(deleteJournal,backup);items.remove(i);
+  if(!deleteStore())deserializeJson(deleteJournal,backup);return;
+ }
+}
+
+bool playerDelete(int index) {
+  if(radioEnabled()||index<0||index>=s_n)return false;
+  auto fs=sdFs();if(!fs)return false;
+  if(!deleteRecord(s_items[index].name))return false;
+  bool was=plSuspend();if(s_running){s_want=was;return false;}
+  char keep[48]={0},target[48];uint32_t block=s_blk;
+  if(s_cur>=0&&s_cur<s_n)snprintf(keep,sizeof(keep),"%s",s_items[s_cur].name);
+  snprintf(target,sizeof(target),"%s",s_items[index].name);
+  if(s_file)s_file.close();s_openIdx=-1;
+  char path[128];plPath(path,sizeof(path),target,".ima");
+  bool ok=!fs->exists(path)||fs->remove(path);
+  if(ok){plPath(path,sizeof(path),target,".json");ok=!fs->exists(path)||fs->remove(path);}
+  plScan();int current=plFind(keep);
+  s_cur=current>=0?current:(s_n?std::min(index,s_n-1):-1);
+  s_blk=current>=0?block:0;++s_seekGen;gInfo.hasItems=s_n>0;plLoadMeta();
+  if(s_cur>=0)playerSaveState();else fs->remove(PL_STATE);
+  if(was&&current>=0){s_want=true;audioPlayerKick();}
+  return ok;
+}
+
+bool playerDeleteName(const char* name){
+ if(!name||!name[0]||strstr(name,"..")||strchr(name,'/')||strchr(name,'\\'))return false;
+ int index=plFind(name);if(index>=0)return playerDelete(index);
+ auto fs=sdFs();if(!fs||!deleteRecord(name))return false;
+ char path[128];for(const char* ext:{".ima",".json"}){plPath(path,sizeof(path),name,ext);if(fs->exists(path)&&!fs->remove(path))return false;}
+ return true;
+}
+bool playerPendingDelete(char* name,size_t size,uint32_t* token){
+ if(!deleteLoad()||!deleteJournal.size())return false;
+ JsonObject item=deleteJournal[0];utf8Trunc(name,size,item["name"] | "");*token=item["token"] | 0u;
+ return playerDeleteName(name);
 }
 
 void playerToggle() {

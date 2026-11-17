@@ -3658,8 +3658,10 @@ def handle_board_msg(raw, reply):
         threading.Thread(target=media_cmd, args=(m.get("cmd", ""),), daemon=True).start()
     elif t == "np_miss":                 # the board wants a cover that is not on the card
         threading.Thread(target=np_miss, args=(m.get("cover", ""),), daemon=True).start()
-    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst", "netradio"):   # answers to SD file / OTA / speak / rtt / player endpoints
+    elif t in ("fack", "fls", "fcat", "frm", "ota", "spk", "pong", "plst", "netradio", "pdel"):   # answers to SD file / OTA / speak / rtt / player endpoints
         _park_reply(m)
+    elif t == "pdel_event":
+        threading.Thread(target=au_sync_delete, args=(dict(m), reply), daemon=True).start()
     elif t == "skins":            # who wears what, after a change on the card or from /test/skin
         if isinstance(m.get("skins"), dict):   # same key as on the hello
             board_skins = m["skins"]
@@ -4309,6 +4311,19 @@ def mem_loop(period_s=600, stop=None, tick_s=None):
         except Exception as e:
             log("mem: sample failed:", e)
 
+_ble_write_guard = None
+_ble_write_guard_loop = None
+
+async def ble_write_line(client, data):
+    import asyncio
+    global _ble_write_guard, _ble_write_guard_loop
+    loop = asyncio.get_running_loop()
+    if _ble_write_guard_loop is not loop:
+        _ble_write_guard, _ble_write_guard_loop = asyncio.Lock(), loop
+    async with _ble_write_guard:
+        for i in range(0, len(data), 100):
+            await client.write_gatt_char(NUS_RX, data[i:i + 100], response=False)
+
 def ble_send(data: bytes):
     import asyncio
     client, loop = _ble_client, _ble_loop
@@ -4316,9 +4331,7 @@ def ble_send(data: bytes):
         return
     async def _w():
         try:
-            for i in range(0, len(data), 100):
-                await client.write_gatt_char(NUS_RX, data[i:i + 100],
-                                             response=False)
+            await ble_write_line(client, data)
         except Exception as e:
             log("ble write error:", e)
     try:
@@ -5136,12 +5149,12 @@ def push_queue_drain(delay=5.0):
     except OSError:
         pass
 
-def push_file(src, dst, progress=None, wait=None):
+def push_file(src, dst, progress=None, wait=None, progress_bytes=256 * 1024):
     """Copy a local file onto the board's microSD at dst (absolute card path).
     fbeg -> chunks of 1024 raw bytes as base64 -> fend; the board verifies size
     + CRC32 and renames its .part over dst. Returns a dict with ok/why/timing.
     Serialized against every other transfer by _file_push_lock.
-    progress(sent, total) is called every ~256 KB when given (audio pushes).
+    progress(sent, total) is called every ~256 KB by default (audio pushes).
     wait=None queues behind whoever holds the lock (OTA, audio, /sd/push —
     the caller asked for exactly this file). wait=N gives up after N s with
     {"ok": False, "busy": True}: for the non-critical pushes (covers, the
@@ -5172,7 +5185,7 @@ def push_file(src, dst, progress=None, wait=None):
             if len(lines) == 4:                    # ~5.6 KB per sendall: full segments
                 tcp_send(("\n".join(lines) + "\n").encode())
                 lines = []
-                if progress and (seq & 0xFF) == 0xFF:      # every 256 KB, never per chunk
+                if progress and (i + 1024) % progress_bytes == 0:
                     try:
                         progress(min(i + 1024, len(data)), len(data))
                     except Exception:
@@ -6994,33 +7007,49 @@ def au_list():
                     "size": size, "pushed": name in au_pushed()})
     return out
 
-def au_rm(name):
-    """Delete one episode here and on the card. The id is a bare episode name:
-    a path is refused outright, never quietly reduced to its last segment."""
+def au_delete_id(name):
     name = str(name or "").strip()
-    if name.endswith(".ima") or name.endswith(".json"):
+    if name.endswith((".ima", ".json")):
         name = name.rsplit(".", 1)[0]
-    if not name or not re.match(r"^[0-9A-Za-z][0-9A-Za-z._-]*$", name) or ".." in name:
-        return {"ok": False, "why": "bad id %r" % str(name)[:40]}
+    if not name or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", name) or ".." in name:
+        raise ValueError("bad id")
+    return name
+
+def au_delete_local(name):
     gone = []
     for ext in (".ima", ".json"):
-        p = au_local(name, ext)
-        if p.exists():
-            try:
-                p.unlink()
-                gone.append(p.name)
-            except OSError as e:
-                return {"ok": False, "why": str(e)}
-    card = {}
-    if gone and au_has_tcp():                      # nothing here means nothing of ours there
-        for ext in (".ima", ".json"):
-            card[ext] = board_rm(au_card(name, ext)).get("ok", False)
-        push_board({"t": "pl"})
+        path = au_local(name, ext)
+        if path.exists():
+            path.unlink()
+            gone.append(path.name)
     if au_pushed().pop(name, None) is not None:
         au_pushed_write()
-    if not gone:
-        return {"ok": False, "why": "no such episode " + name, "name": name}
-    return {"ok": True, "name": name, "local": gone, "card": card}
+    return gone
+
+def au_sync_delete(message, reply):
+    try:
+        name = au_delete_id(message.get("name"))
+        with _file_push_lock:
+            au_delete_local(name)
+        reply((json.dumps({"t": "pdel_ack", "name": name, "token": message["token"]}) + "\n").encode())
+    except Exception as exc:
+        log("audio delete sync failed:", exc)
+
+def au_rm(name):
+    try:
+        name = au_delete_id(name)
+        if not (au_has_tcp() or _ble_client is not None):
+            return {"ok": False, "why": tr("请通过 Wi-Fi 或蓝牙连接板子后删除", "Connect the board over Wi-Fi or Bluetooth before deleting")}
+        with _file_push_lock:
+            rid = _new_rid()
+            push_board({"t": "pdel", "id": rid, "name": name})
+            result = wait_reply("pdel", rid, 8)
+            if not result or not result.get("ok"):
+                return {"ok": False, "why": (result or {}).get("why", tr("板子未确认删除，请检查固件及连接", "Board did not confirm deletion; check firmware and connection"))}
+            gone = au_delete_local(name)
+        return {"ok": True, "name": name, "local": gone, "card": True}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "why": str(exc)}
 
 # ---- the worker ----
 def au_episode(ep):
@@ -7176,13 +7205,15 @@ def au_status():
     return {"job": job, "queue": q, "busy": bool(job or q), "done": done,
             "tcp": au_has_tcp(), "pending": [n for n in au_names() if n not in au_pushed()]}
 
-def radio_request(op, feed=""):
+def radio_request(op, feed="", enabled=True, page=0, tcp_only=False):
     """Initial configuration only; the board fetches RSS and MP3 itself."""
-    if op not in ("status", "config", "disable"):
+    if op not in ("status", "config", "disable", "list", "refresh", "import"):
         return {"ok": False, "why": "unknown radio operation"}
     if not board_radio_supported:
         return {"ok": False, "supported": False, "why": tr("请先烧录支持独立 RSS 播放的新版固件", "Update the board firmware for standalone RSS playback")}
     payload = {"t": "netradio", "op": op, "id": _new_rid()}
+    if op == "list":
+        payload["page"] = max(0, int(page))
     if op == "config":
         if not isinstance(feed, str) or len(feed) > 1023:
             return {"ok": False, "why": "invalid RSS URL"}
@@ -7194,11 +7225,75 @@ def radio_request(op, feed=""):
             valid = False
         if not valid:
             return {"ok": False, "why": tr("请输入 HTTP(S) RSS 地址", "Enter an HTTP(S) RSS URL")}
-        payload.update(feed=parsed.geturl(), enabled=True)
+        payload.update(feed=parsed.geturl(), enabled=bool(enabled))
     if not (_ble_client is not None or au_has_tcp()):
         return {"ok": False, "why": tr("配置时需连接板子，播放时无需连接 Mac", "Connect the board to configure it; playback does not need this Mac")}
-    push_board(payload)
+    if tcp_only:
+        if not au_has_tcp():
+            return {"ok": False, "why": tr("板子的 Wi-Fi 连接已断开", "Board Wi-Fi connection lost")}
+        push_tcp(payload)
+    else:
+        push_board(payload)
     return wait_reply("netradio", payload["id"], 5) or {"ok": False, "why": tr("板子未回复", "No response from board")}
+
+_radio_update_lock = threading.Lock()
+_radio_progress = {"stage": "idle", "sent": 0, "total": 0}
+
+def radio_progress(stage, sent=0, total=0):
+    global _radio_progress
+    _radio_progress = {"stage": stage, "sent": sent, "total": total}
+
+def radio_update_local():
+    if not _radio_update_lock.acquire(blocking=False):
+        return {"ok": False, "why": tr("节目正在更新", "Episode update already in progress")}
+    radio_progress("check")
+    try:
+        result = _radio_update_local()
+        if not result.get("ok"):
+            radio_progress("error")
+        return result
+    finally:
+        _radio_update_lock.release()
+
+def _radio_update_local():
+    """Download and parse RSS on this Mac, then copy metadata to the board."""
+    if not au_has_tcp():
+        return {"ok": False, "why": tr("请将板子与本机连接到同一 Wi-Fi，等待连接后再更新节目", "Connect the board and this Mac to the same Wi-Fi and wait for the connection before updating episodes")}
+    status = radio_request("status", tcp_only=True)
+    if not status.get("ok"):
+        return status
+    if not status.get("enabled") or not status.get("feed"):
+        return {"ok": False, "why": tr("请先启用网络 RSS 并保存订阅地址", "Enable RSS and save a feed first")}
+    try:
+        radio_progress("download")
+        data, _ = au_get(status["feed"], 32 * 1024 * 1024, "RSS")
+        radio_progress("parse")
+        feed = au_rss_parse(data, 0)
+        items = []
+        for ep in feed["items"]:
+            url = urlsplit(ep["url"])
+            if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+                continue
+            if au_ext(ep["url"]) != ".mp3":
+                continue
+            items.append({"title": ep["title"].encode("utf-8")[:191].decode("utf-8", "ignore"),
+                          "url": ep["url"], "dur": min(7 * 86400, max(0, ep["dur"]))})
+        if not items:
+            return {"ok": False, "why": tr("RSS 中没有可用的 MP3 节目", "No playable MP3 episodes in RSS")}
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="agentpet-rss-") as directory:
+            path = Path(directory) / "rss-import.json"
+            path.write_text(json.dumps({"version": 1, "seq": 0, "feed": status["feed"],
+                                        "show": feed["show"], "items": items}, ensure_ascii=False), encoding="utf-8")
+            radio_progress("transfer", 0, path.stat().st_size)
+            result = push_file(path, "/agentpet/rss-import.json",
+                progress=lambda sent, total: radio_progress("transfer", sent, total), progress_bytes=4096)
+        if not result.get("ok"):
+            return result
+        radio_progress("import")
+        return radio_request("import")
+    except Exception as exc:
+        return {"ok": False, "why": str(exc)}
 
 # ------------------------------------------------------------------ settings page
 # http://127.0.0.1:8788/settings — the third tier of the settings hierarchy
@@ -7212,7 +7307,8 @@ def radio_request(op, feed=""):
 # Values under data-th keys are trusted HTML (they carry <code>).
 SETTINGS_T = {
  "zh": {
-  "radio_title": "板子独立联网播客", "radio_hint": "首次配置 RSS 后，板子自己联网刷新和播放，Mac 可以关闭。当前支持 MP3 音频，不保存整集到 SD 卡。", "radio_feed": "RSS 订阅地址", "radio_save": "保存并启用", "radio_load": "读取板子设置", "radio_sd": "使用 SD 卡播客", "radio_sd_title": "下载到 SD 卡（原有方式）", "radio_idle": "连接板子后读取或保存 RSS 设置",
+  "radio_episodes": "节目列表", "radio_prev": "上一页", "radio_next": "下一页", "radio_empty": "暂无节目，请在板子上刷新 RSS",
+  "radio_title": "板子独立联网播客", "radio_hint": "首次配置 RSS 后，板子自己联网刷新和播放，Mac 可以关闭。当前支持 MP3 音频，不保存整集到 SD 卡。", "radio_feed": "RSS 订阅地址", "radio_save": "保存", "radio_read": "读取板子", "radio_refresh": "更新节目", "radio_refreshing": "正在更新节目…", "radio_wifi_hint": "请将板子与本机连接到同一 Wi-Fi 后更新节目", "radio_download": "正在下载 RSS…", "radio_parse": "正在解析节目…", "radio_transfer": "正在传输到板子", "radio_import": "正在导入节目…", "radio_done": "节目已更新", "radio_mode": "播放模式", "radio_rss": "网络 RSS", "radio_sd": "离线模式", "radio_sd_title": "下载到 SD 卡（原有方式）", "radio_idle": "连接板子后自动读取 RSS 设置",
 
   "title": "AgentTouch 设置", "lang_saved": "语言：中文",
   "loading": "读取中", "loading_dots": "读取中……", "board": "板子",
@@ -7336,7 +7432,8 @@ SETTINGS_T = {
   "saved": "已保存 {0} 项：{1}", "save_fail": "保存失败：", "no_host": "读不到 host：",
  },
  "en": {
-  "radio_title": "Standalone Wi-Fi podcasts", "radio_hint": "Configure RSS once. The board fetches episodes and plays MP3 over Wi-Fi without this Mac or saving entire episodes to SD. Refresh and choose episodes on the board; playback controls stay the same.", "radio_feed": "RSS feed URL", "radio_save": "Save and enable", "radio_load": "Read board settings", "radio_sd": "Use SD podcasts", "radio_sd_title": "Download to SD (existing mode)", "radio_idle": "Connect the board to read or save its RSS settings",
+  "radio_episodes": "Episodes", "radio_prev": "Previous", "radio_next": "Next", "radio_empty": "No episodes. Refresh RSS on the board.",
+  "radio_title": "Standalone Wi-Fi podcasts", "radio_hint": "Configure RSS once. The board fetches episodes and plays MP3 over Wi-Fi without this Mac or saving entire episodes to SD. Refresh and choose episodes on the board; playback controls stay the same.", "radio_feed": "RSS feed URL", "radio_save": "Save", "radio_read": "Read board info", "radio_refresh": "Update episodes", "radio_refreshing": "Updating episodes…", "radio_wifi_hint": "Connect the board and this Mac to the same Wi-Fi to update episodes", "radio_download": "Downloading RSS…", "radio_parse": "Parsing episodes…", "radio_transfer": "Transferring to board", "radio_import": "Importing episodes…", "radio_done": "Episodes updated", "radio_mode": "Playback mode", "radio_rss": "RSS / Wi-Fi", "radio_sd": "Offline mode", "radio_sd_title": "Download to SD (existing mode)", "radio_idle": "Connect the board to load its RSS settings automatically",
 
   "title": "AgentTouch Settings", "lang_saved": "Language: English",
   "loading": "Loading", "loading_dots": "Loading…", "board": "Board",
@@ -7549,6 +7646,7 @@ textarea{width:100%;font-size:12px;line-height:1.5;min-height:150px;resize:verti
 input[type=range]{width:220px;accent-color:#fff;margin:0}
 .ownbar{display:flex;align-items:center;gap:12px;margin:0 40px 8px;padding:10px 14px;border-radius:12px;
  background:rgba(255,214,10,.10);color:#ffd60a;font-size:13px;flex:none}
+[hidden]{display:none!important}
 .ownbar[hidden]{display:none}.ownbar span{flex:1}
 .pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;font-size:12px;font-weight:500;
  background:rgba(255,255,255,.08);color:rgba(255,255,255,.62);white-space:nowrap}
@@ -7704,19 +7802,24 @@ footer .sp{flex:1}
  </div>
 
  <div class="page" data-page="audio">
-  <section><div class="grp">
+  <section><div class="grp"><div class="row" style="flex-wrap:wrap"><div class="lab" data-t="radio_mode"></div><div class="seg" id="radiomode"><button type="button" id="mode-rss" onclick="radioMode(true)" data-t="radio_rss" aria-pressed="false"></button><button type="button" id="mode-sd" onclick="radioMode(false)" data-t="radio_sd" aria-pressed="false"></button></div></div><div class="row" hidden><div class="lab"><small id="radiostatus"></small></div></div><div id="radio-rss-panel">
    <div class="row"><div class="lab"><span data-t="radio_title"></span><small data-t="radio_hint"></small></div></div>
+   <div class="row" style="flex-direction:column;align-items:flex-start;gap:8px;padding-top:12px;padding-bottom:12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><button type="button" class="sm" id="radioread" onclick="radioRead()" data-t="radio_read"></button><button type="button" class="sm" id="radiorefresh" disabled onclick="radioRefresh()" data-t="radio_refresh"></button></div>
+    <small id="radiowifihint" data-t="radio_wifi_hint" style="font-size:12px;color:rgba(255,255,255,.45);line-height:1.5;text-align:left"></small>
+   </div>
    <div class="row" style="flex-wrap:wrap"><label for="radiofeed" data-t="radio_feed"></label><input type="url" class="g" id="radiofeed" placeholder="https://feeds.daopub.com/ld.xml" autocomplete="off"><button type="button" class="pri sm" onclick="radioConfig()" data-t="radio_save"></button></div>
-   <div class="row" style="flex-wrap:wrap"><button type="button" class="sm" onclick="radioLoad(true)" data-t="radio_load"></button><button type="button" class="sm" onclick="radioDisable()" data-t="radio_sd"></button><div class="lab"><small id="radiostatus" data-t="radio_idle"></small></div></div>
-  </div></section>
-  <section><div class="row"><div class="lab" data-t="radio_sd_title"></div></div></section>
-  <section><div class="grp">
+<div class="row" id="radioprogressrow" hidden><div class="lab"><small id="radioprogresslabel" role="status"></small><progress id="radioprogress" max="100" style="width:100%;margin-top:8px"></progress></div></div>
+<div id="radioepisodes"><details ontoggle="if(this.open)radioEpisodes(0)"><summary style="padding:14px 18px;cursor:pointer" data-t="radio_episodes"></summary><div id="radioitems"></div><div class="row"><button type="button" class="sm" id="radioprev" onclick="radioEpisodes(radioPage-1)" data-t="radio_prev"></button><span id="radiopages"></span><button type="button" class="sm" id="radionext" onclick="radioEpisodes(radioPage+1)" data-t="radio_next"></button></div></details></div>
+  </div><div id="radio-sd-panel" hidden>
+   <div class="row"><div class="lab" data-t="radio_sd_title"></div></div>
    <div class="row" style="min-height:60px"><input type="text" class="g" id="au" data-tp="au_ph">
     <select id="aun"><option value="1" data-t="au_n1"></option><option value="3" data-t="au_n3"></option><option value="5" data-t="au_n5"></option></select>
     <button class="pri sm" onclick="auAdd()" data-t="add"></button></div>
    <div class="row"><div class="lab"><span data-t="queue"></span><small id="aust" data-t="loading_dots"></small></div></div>
    <div id="aulist"></div>
-  </div><p class="cap" data-t="au_cap"></p></section>
+   <p class="cap" style="padding:0 18px" data-t="au_cap"></p>
+  </div></div></section>
  </div>
 
  <div class="page" data-page="host">
@@ -8105,13 +8208,54 @@ function auTick(){fetch(API+'/audio/status').then(r=>r.json()).then(d=>{
  if(d.busy!==auBusy||auN%4===0){auBusy=d.busy;auList()}
  auN++}).catch(()=>{})}
 auTick();setInterval(auTick,3000);
+let radioEnabled=false,radioFeed="";
+function radioTab(rss){$('#radio-rss-panel').hidden=!rss;$('#radio-sd-panel').hidden=rss;
+ for(const [id,on] of [['mode-rss',rss],['mode-sd',!rss]]){const b=$('#'+id);b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on))}}
+let radioWifiReady=false,radioWifiChecking=false,radioUpdating=false,radioBoardRefreshing=false;
+function radioUpdateButton(){$('#radiorefresh').disabled=!radioWifiReady||radioUpdating||radioBoardRefreshing;$('#radiowifihint').hidden=radioWifiReady}
+async function radioWifiCheck(){if(radioWifiChecking||radioUpdating)return;radioWifiChecking=true;
+ try{const d=await fetch(API+'/radio/ready').then(r=>r.json());radioWifiReady=!!d.ok}catch(e){radioWifiReady=false}finally{radioWifiChecking=false;radioUpdateButton()}}
+setInterval(()=>{if(document.querySelector('.page[data-page="audio"]').classList.contains('on'))radioWifiCheck()},5000);
 function radioPaint(d,fill){const e=$('#radiostatus');delete e.dataset.t;
- e.textContent=d.ok?[d.enabled?'RSS / Wi-Fi':'SD',d.state,d.count==null?'':d.count+' episodes',d.buffer_s==null?'':'buffer '+Number(d.buffer_s).toFixed(1)+' s',d.error].filter(Boolean).join(' · '):(d.why||'Not available');
- if(d.ok&&fill)$('#radiofeed').value=d.feed||''}
-function radioLoad(fill=false){fetch(API+'/radio/status').then(r=>r.json()).then(d=>radioPaint(d,fill)).catch(e=>{$('#radiostatus').textContent=String(e)})}
+ e.textContent=d.ok?(d.enabled?(d.error||''):''):(d.why||'Not available');e.closest('.row').hidden=!e.textContent;
+ if(d.ok){radioTab(!!d.enabled);radioBoardRefreshing=!!d.refreshing;radioUpdateButton(); if(d.refreshing&&!d.error){e.textContent=t('radio_refreshing');e.closest('.row').hidden=false}}
+ if(d.ok){radioEnabled=!!d.enabled;radioFeed=d.feed||'';for(const [id,on] of [['mode-rss',radioEnabled],['mode-sd',!radioEnabled]]){const b=$('#'+id);b.classList.toggle('on',on);b.setAttribute('aria-pressed',String(on))}if(fill)$('#radiofeed').value=radioFeed}}
+let radioPage=0,radioListBusy=false;
+async function radioEpisodes(page){if(radioListBusy)return;radioListBusy=true;
+ const prev=$('#radioprev'),next=$('#radionext'),items=$('#radioitems');prev.disabled=next.disabled=true;
+ try{const d=await fetch(API+'/radio/episodes?page='+Math.max(0,page)).then(r=>r.json());
+ items.replaceChildren();if(!d.ok)throw Error(d.why||'Failed');radioPage=d.page||0;
+ for(const ep of d.episodes||[]){const row=document.createElement('div');row.className='row';row.textContent=(ep.index+1)+'. '+ep.title;items.appendChild(row)}
+ if(!items.childElementCount){const row=document.createElement('div');row.className='row';row.textContent=t('radio_empty');items.appendChild(row)}
+ const pages=Math.max(1,Math.ceil((d.count||0)/10));$('#radiopages').textContent=(radioPage+1)+' / '+pages;prev.disabled=radioPage===0;next.disabled=radioPage+1>=pages;
+ }catch(e){items.textContent=String(e);$('#radiopages').textContent='';}finally{radioListBusy=false}}
+function radioLoad(fill=false){return fetch(API+'/radio/status').then(r=>r.json()).then(d=>{radioPaint(d,fill);radioWifiCheck();return d}).catch(e=>{const el=$('#radiostatus');el.textContent=String(e);el.closest('.row').hidden=false})}
+async function radioRead(){const b=$('#radioread');b.disabled=true;try{const d=await radioLoad(true);if(d&&d.ok)await radioEpisodes(radioPage)}finally{b.disabled=false}}
+let radioRefreshTimer=null;
+function radioProgressPaint(d){$('#radioprogressrow').hidden=false;const bar=$('#radioprogress');
+ const key={download:'radio_download',parse:'radio_parse',transfer:'radio_transfer',import:'radio_import',done:'radio_done'}[d.stage]||'radio_refreshing';
+ let label=t(key);if(d.stage==='transfer'&&d.total){bar.value=Math.round(d.sent/d.total*100);label+=' · '+bar.value+'%'}else if(d.stage==='done'){bar.value=100}else{bar.removeAttribute('value')}
+ $('#radioprogresslabel').textContent=label}
+async function radioRefresh(){if(!radioWifiReady||radioUpdating)return;const b=$('#radiorefresh');radioUpdating=true;radioUpdateButton();$('#radioprogressrow').hidden=true;$('#radioprogress').hidden=false;
+ let tracking=true;async function track(){if(!tracking)return;try{const p=await fetch(API+'/radio/progress').then(r=>r.json());if(tracking&&['download','parse','transfer','import'].includes(p.stage))radioProgressPaint(p)}catch(e){}if(tracking)radioRefreshTimer=setTimeout(track,500)}
+ radioRefreshTimer=setTimeout(track,500);
+ try{const d=await fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'refresh'})}).then(r=>r.json());
+ tracking=false;clearTimeout(radioRefreshTimer);if(!d.ok)throw Error(d.why||'Failed');radioProgressPaint({stage:'import'});
+ async function poll(){try{const status=await radioLoad(false);if(!status||!status.ok)throw Error((status||{}).why||'Failed');
+ if(status.refreshing){radioRefreshTimer=setTimeout(poll,1000);return}
+ if(status.refresh_error||status.error)throw Error(status.refresh_error||status.error);
+ radioProgressPaint({stage:'done'});radioUpdating=false;radioUpdateButton();radioWifiCheck();await radioEpisodes(0);
+ }catch(e){$('#radioprogresslabel').textContent=String(e);$('#radioprogressrow').hidden=false;$('#radioprogress').hidden=true;radioUpdating=false;radioUpdateButton();radioWifiCheck()}}
+ $('#radioprogress').hidden=false;await poll();
+ }catch(e){tracking=false;clearTimeout(radioRefreshTimer);$('#radioprogresslabel').textContent=String(e);$('#radioprogressrow').hidden=false;$('#radioprogress').hidden=true;radioUpdating=false;radioUpdateButton();radioWifiCheck()}}
 function radioConfig(){const feed=$('#radiofeed').value.trim();if(!feed)return;
- fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'config',feed})}).then(r=>r.json()).then(d=>{radioPaint(d,true);toast(d.ok?t('saved').replace('{0}','1').replace('{1}','RSS'):(d.why||'Failed'))}).catch(e=>toast(String(e)))}
-function radioDisable(){fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'disable'})}).then(r=>r.json()).then(d=>radioPaint(d,true)).catch(e=>toast(String(e)))}
+ fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'config',feed,enabled:radioEnabled})}).then(r=>r.json()).then(d=>{radioPaint(d,true);toast(d.ok?t('saved').replace('{0}','1').replace('{1}','RSS'):(d.why||'Failed'))}).catch(e=>toast(String(e)))}
+function radioMode(enabled){radioTab(enabled);if(enabled===radioEnabled)return;
+ const feed=radioFeed||$('#radiofeed').value.trim();
+ if(enabled&&!feed){$('#radiofeed').reportValidity();$('#radiofeed').focus();toast(t('radio_feed'));return}
+ $('#radiomode').classList.add('dis');
+ fetch(API+'/radio/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(enabled?{op:'config',feed,enabled:true}:{op:'disable'})}).then(r=>r.json()).then(d=>radioPaint(d,false)).catch(e=>toast(String(e))).finally(()=>$('#radiomode').classList.remove('dis'))}
+
 
 // ---- host memory trend: its own slow timer (30 s), the line is SVG ----
 function memTick(){fetch(API+'/host/mem').then(r=>r.json()).then(d=>{
@@ -8563,6 +8707,18 @@ class HookHandler(BaseHTTPRequestHandler):
                                     ensure_ascii=False).encode())
             else:
                 self._ok(json.dumps(np_snapshot(), ensure_ascii=False).encode())
+        elif self.path.startswith("/radio/episodes?"):
+            q = dict(parse_qsl(self.path.partition("?")[2]))
+            try:
+                page = max(0, int(q.get("page", "0")))
+            except ValueError:
+                page = 0
+            self._ok(json.dumps(radio_request("list", page=page), ensure_ascii=False).encode())
+        elif self.path == "/radio/ready":
+            ready = radio_request("status", tcp_only=True) if au_has_tcp() else {"ok": False}
+            self._ok(json.dumps({"ok": bool(ready.get("ok"))}).encode())
+        elif self.path == "/radio/progress":
+            self._ok(json.dumps(_radio_progress).encode())
         elif self.path == "/radio/status":
             self._ok(json.dumps(radio_request("status"), ensure_ascii=False).encode())
         elif self.path.startswith("/audio/"):
@@ -9040,7 +9196,7 @@ class HookHandler(BaseHTTPRequestHandler):
         except ValueError:
             payload = {}
         if self.path == "/radio/config":
-            r = radio_request(payload.get("op", "config"), payload.get("feed", "")) if isinstance(payload, dict) else {"ok": False, "why": "need JSON object"}
+            r = (radio_update_local() if payload.get("op") == "refresh" else radio_request(payload.get("op", "config"), payload.get("feed", ""), payload.get("enabled", True))) if isinstance(payload, dict) else {"ok": False, "why": "need JSON object"}
             self._ok(json.dumps(r, ensure_ascii=False).encode())
             return
         if self.path == "/settings/save":

@@ -104,6 +104,7 @@ void clearBuffer(){head=tail=fill=played=0;buffering=true;eof=false;prebufferTar
 
 // Metadata only, on an already-mounted SD card. Never format storage here.
 bool cacheStorageReady=false,cachePending=true;
+bool importPending=false;
 bool cacheDirty=false; // owned exclusively by the RSS/cache worker
 fs::FS* cacheFs=nullptr;
 uint32_t cacheRetryAt=0;
@@ -116,9 +117,10 @@ struct CacheAllocator : ArduinoJson::Allocator {
  void deallocate(void* p) override{free(p);}
  void* reallocate(void* p,size_t n) override{return heap_caps_realloc(p,n,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);}
 };
-bool cacheLoad(fs::FS& fs,uint32_t g,const String& url){
+bool cacheLoad(fs::FS& fs,uint32_t g,const String& url,bool imported=false){
  std::vector<radiofeed::Episode> best;String cachedShow;uint64_t bestSeq=0;
- for(const char* path:CACHE_SLOTS){
+ const char* paths[2]={imported?"/agentpet/rss-import.json":CACHE_SLOTS[0],imported?"/agentpet/rss-import.json":CACHE_SLOTS[1]};
+ for(const char* path:paths){
   File file=fs.open(path,FILE_READ);if(!file){if(file)file.close();continue;}
   CacheAllocator allocator;JsonDocument doc(&allocator);auto err=deserializeJson(doc,file);file.close();if(err)continue;
   uint64_t seq=doc["seq"] | (uint64_t)0;
@@ -135,7 +137,7 @@ bool cacheLoad(fs::FS& fs,uint32_t g,const String& url){
  if(best.empty())return false;
  Guard l;if(g!=generation||url!=feedUrl)return false;
  // Inserting a card during playback must not replace the current selection.
- if(!episodes.empty())return radiofeed::sameCache(episodes,best)&&show==cachedShow;
+ if(!imported&&!episodes.empty())return radiofeed::sameCache(episodes,best)&&show==cachedShow;
  episodes=std::move(best);show=cachedShow;selected=restoredSelection();baseSec=resumePosition();refresh=false;want=false;state="idle";error="";
  return true;
 }
@@ -624,6 +626,10 @@ void worker(void*){
 void feedWorker(void*){
  uint32_t handled=0;
  for(;;){
+  bool importing;uint32_t importGen;String importUrl;
+  {Guard l;importing=importPending;importPending=false;importGen=generation;importUrl=feedUrl;}
+  if(importing){auto fs=sdFs();bool ok=fs&&cacheLoad(*fs,importGen,importUrl,true);
+   if(ok){cacheDirty=true;cacheService();}else{Guard l;feedError="RSS import failed";refresh=false;}}
   cacheService();
   uint32_t g;bool fetch;String url;
   {Guard l;g=feedGeneration;fetch=enabled&&refresh;url=feedUrl;}
@@ -664,6 +670,9 @@ bool radioConfigure(const char* url,bool on){
  prefs.putString("feed",value);prefs.putBool("enabled",on);return true;
 }
 void radioDisable(){if(!initialized)return;String saved;{Guard l;saved=feedUrl;}radioConfigure(saved.c_str(),false);}
+void radioImport(){
+ if(!initialized)return;Guard l;saveResume();++generation;++feedGeneration;want=false;clearBuffer();refresh=true;feedError="";importPending=true;
+}
 void radioRefresh(){
  if(!initialized)return;Guard l;if(!enabled || refresh)return;
  ++feedGeneration;cachePending=false;refresh=true;feedError="";fetchDoneUntil=0;

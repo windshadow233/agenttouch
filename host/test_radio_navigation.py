@@ -25,11 +25,16 @@ std::vector<radiofeed::Episode> episodes;
 String lastEpisode;
 int selected=-1;
 struct Prefs {int writes=0;String stored;void putString(const char*,const String& s){stored=s;writes++;}} prefs;
-bool radioEnabled(){return true;}
+bool online=true;
+bool radioEnabled(){return online;}
 int radioCount(){return episodes.size();}
 struct Info {int index;};
 Info radioInfo(){return {selected};}
 void radioSelect(int i,bool){selected=i;}
+int playerCount(){return episodes.size();}
+Info playerInfo(){return {selected};}
+bool playerSelect(int i){selected=i;return true;}
+bool playerDelete(int i){episodes.erase(episodes.begin()+i);return true;}
 bool fetching=false;int fetches=0,cancels=0;
 bool radioRefreshing(){return fetching;}
 void radioRefresh(){fetching=true;fetches++;}
@@ -65,6 +70,13 @@ int main(){
  radioPageTap(100,430);assert(fetching&&fetches==1&&cancels==0);
  radioPageTap(100,430);assert(!fetching&&fetches==1&&cancels==1);
  radioPageTap(100,430);assert(fetching&&fetches==2);
+ online=false;for(int i=0;i<5;++i)episodes.push_back({});selected=0;
+ radioPageTap(350,430);assert(netList&&netListPage==0);
+ radioPageTap(400,90);assert(offlineDelete==0&&episodes.size()==5);
+ radioPageTap(400,90);assert(offlineDelete==-1&&episodes.size()==4&&netList);
+ radioPageTap(100,90);assert(selected==0&&!netList);
+ radioPageTap(350,430);radioPageTap(400,90);radioListStep(1);assert(offlineDelete==-1);
+
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
