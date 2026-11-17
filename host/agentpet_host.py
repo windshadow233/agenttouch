@@ -1207,16 +1207,18 @@ def unread_tick(prev, snap):
     return False
 
 
-def raise_agent_app(agent, wait=0.5, focus_input=False):
-    """Focus insurance before typing/dictating into an agent's window (the
-    user may have clicked elsewhere since focus follow ran): if the app is
-    not frontmost, raise it, give the window server a beat, and re-press its
-    input-focus key. Voice input also reasserts input focus when the app is
-    already front; approval actions keep their existing card focus.
-    Runs on the inject worker, never on a link thread: the BLE link handles
-    messages inside bleak's asyncio callback, and the first version slept
-    here for 0.5 s (10 s worst case on a stuck `open -a`) with the whole
-    BLE loop frozen behind it (2026-09-02 review)."""
+def press_focus_key(agent):
+    """Reassert the configured input target before any agent action."""
+    keyspec = FOCUS_KEYS.get(agent)
+    if keyspec:
+        post_key(keyspec)
+        time.sleep(0.15)
+
+
+def raise_agent_app(agent, wait=0.5):
+    """Raise the target app when needed and always press its focus key.
+    Runs on the inject worker so link callbacks remain responsive.
+    """
     global host_raise_at
     app = FOCUS_APPS.get(agent)
     if not (FOCUS_FOLLOW and app):
@@ -1229,14 +1231,7 @@ def raise_agent_app(agent, wait=0.5, focus_input=False):
         # for the Forest seat, so the approve Enter went to the wrong window
         # (2026-09-13 16:58)
         log("focus insurance:", app, "already front")
-        if focus_input:
-            keyspec = FOCUS_KEYS.get(agent)
-            if keyspec:
-                post_key(keyspec)
-                time.sleep(0.15)
-                log("voice input focus:", agent, "->", keyspec)
-            else:
-                log("voice input focus: no shortcut configured for", agent)
+        press_focus_key(agent)
         return
     try:
         subprocess.run(["open", "-a", app], capture_output=True, timeout=2)
@@ -1244,10 +1239,7 @@ def raise_agent_app(agent, wait=0.5, focus_input=False):
         log("focus insurance: open -a", app, "timed out, typing anyway")
     _focus_raised[agent] = time.time()   # arm the CPU-mute, same as focus follow
     time.sleep(wait)
-    keyspec = FOCUS_KEYS.get(agent)
-    if keyspec:
-        post_key(keyspec)
-        time.sleep(0.15)
+    press_focus_key(agent)
     log("focus insurance:", agent, "->", app, f"(front was {front or '?'})")
 
 # Single worker for everything that raises a window and then presses keys
@@ -2742,6 +2734,9 @@ def focus_session(sid):
     _focus_raised["claude"] = time.time()
     if done and done != "app":
         _sess_front["sid"] = sid
+    if done and FOCUS_KEYS.get("claude"):
+        time.sleep(0.15)
+        press_focus_key("claude")
     log("focus session:", sid[:8], kind or "?", "->", done or "nothing")
     return done
 
@@ -3733,7 +3728,7 @@ def handle_board_msg(raw, reply):
                 elif voice_sid:
                     focus_session_fast(voice_sid)   # that session's own tab
                 else:
-                    raise_agent_app(agent, wait=0.15, focus_input=True)
+                    raise_agent_app(agent, wait=0.15)
 
             # Prepare mic and focus concurrently; dispatch the shortcut only after both finish.
             inject(lambda: voice_start_timed(focus, board_mic, received_at,
